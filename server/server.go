@@ -1,20 +1,41 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package server
 
 import (
 	"encoding/json"
 	"errors"
+	"net"
+	"net/http"
+	"sync"
 	"time"
 
-	"github.com/coreos/fleet/third_party/github.com/coreos/go-etcd/etcd"
-	log "github.com/coreos/fleet/third_party/github.com/golang/glog"
+	etcd "github.com/coreos/etcd/client"
+	"github.com/coreos/go-systemd/activation"
 
 	"github.com/coreos/fleet/agent"
+	"github.com/coreos/fleet/api"
 	"github.com/coreos/fleet/config"
 	"github.com/coreos/fleet/engine"
-	"github.com/coreos/fleet/event"
+	"github.com/coreos/fleet/heart"
+	"github.com/coreos/fleet/log"
 	"github.com/coreos/fleet/machine"
+	"github.com/coreos/fleet/pkg"
+	"github.com/coreos/fleet/pkg/lease"
 	"github.com/coreos/fleet/registry"
-	"github.com/coreos/fleet/sign"
+	"github.com/coreos/fleet/registry/rpc"
 	"github.com/coreos/fleet/systemd"
 	"github.com/coreos/fleet/unit"
 	"github.com/coreos/fleet/version"
@@ -24,77 +45,154 @@ const (
 	// machineStateRefreshInterval is the amount of time the server will
 	// wait before each attempt to refresh the local machine state
 	machineStateRefreshInterval = time.Minute
+
+	shutdownTimeout = time.Minute
 )
 
 type Server struct {
-	agent   *agent.Agent
-	engine  *engine.Engine
-	rStream *registry.EventStream
-	sStream *systemd.EventStream
-	eBus    *event.EventBus
-	mach    *machine.CoreOSMachine
+	agent          *agent.Agent
+	aReconciler    *agent.AgentReconciler
+	usPub          *agent.UnitStatePublisher
+	usGen          *unit.UnitStateGenerator
+	engine         *engine.Engine
+	mach           *machine.CoreOSMachine
+	hrt            heart.Heart
+	mon            *Monitor
+	api            *api.Server
+	disableEngine  bool
+	reconfigServer bool
+	restartServer  bool
 
-	stop chan bool
+	engineReconcileInterval time.Duration
+
+	killc chan struct{}  // used to signal monitor to shutdown server
+	stopc chan struct{}  // used to terminate all other goroutines
+	wg    sync.WaitGroup // used to co-ordinate shutdown
 }
 
-func New(cfg config.Config) (*Server, error) {
-	mach, err := newMachineFromConfig(cfg)
+func New(cfg config.Config, listeners []net.Listener) (*Server, error) {
+	agentTTL, err := time.ParseDuration(cfg.AgentTTL)
 	if err != nil {
 		return nil, err
 	}
 
-	mgr, err := systemd.NewSystemdUnitManager(systemd.DefaultUnitsDirectory)
+	mgr, err := systemd.NewSystemdUnitManager(cfg.UnitsDirectory, cfg.SystemdUser)
 	if err != nil {
 		return nil, err
 	}
 
-	a, err := newAgentFromConfig(mach, cfg, mgr)
+	mach, err := newMachineFromConfig(cfg, mgr)
 	if err != nil {
 		return nil, err
 	}
 
-	e, err := newEngineFromConfig(mach, cfg)
+	tlsConfig, err := pkg.ReadTLSConfigFiles(cfg.EtcdCAFile, cfg.EtcdCertFile, cfg.EtcdKeyFile)
 	if err != nil {
 		return nil, err
 	}
 
-	sStream := systemd.NewEventStream(mgr)
+	eCfg := etcd.Config{
+		Transport:               &http.Transport{TLSClientConfig: tlsConfig},
+		Endpoints:               cfg.EtcdServers,
+		HeaderTimeoutPerRequest: (time.Duration(cfg.EtcdRequestTimeout*1000) * time.Millisecond),
+		Username:                cfg.EtcdUsername,
+		Password:                cfg.EtcdPassword,
+	}
 
-	rStream, err := newRegistryEventStreamFromConfig(cfg)
+	eClient, err := etcd.New(eCfg)
 	if err != nil {
 		return nil, err
 	}
 
-	aHandler := agent.NewEventHandler(a)
-	eHandler := engine.NewEventHandler(e)
+	kAPI := etcd.NewKeysAPI(eClient)
 
-	eBus := event.NewEventBus()
-	eBus.AddListener("engine", eHandler)
-	eBus.AddListener("agent", aHandler)
+	var (
+		reg        engine.CompleteRegistry
+		genericReg interface{}
+	)
+	lManager := lease.NewEtcdLeaseManager(kAPI, cfg.EtcdKeyPrefix)
 
-	return &Server{a, e, rStream, sStream, eBus, mach, nil}, nil
+	if !cfg.EnableGRPC {
+		genericReg = registry.NewEtcdRegistry(kAPI, cfg.EtcdKeyPrefix)
+		if obj, ok := genericReg.(engine.CompleteRegistry); ok {
+			reg = obj
+		}
+	} else {
+		etcdReg := registry.NewEtcdRegistry(kAPI, cfg.EtcdKeyPrefix)
+		genericReg = rpc.NewRegistryMux(etcdReg, mach, lManager)
+		if obj, ok := genericReg.(engine.CompleteRegistry); ok {
+			reg = obj
+		}
+	}
+
+	pub := agent.NewUnitStatePublisher(reg, mach, agentTTL)
+	gen := unit.NewUnitStateGenerator(mgr)
+
+	a := agent.New(mgr, gen, reg, mach, agentTTL)
+
+	var rStream pkg.EventStream
+	if !cfg.DisableWatches {
+		rStream = registry.NewEtcdEventStream(kAPI, cfg.EtcdKeyPrefix)
+	}
+
+	ar := agent.NewReconciler(reg, rStream)
+
+	var e *engine.Engine
+	if !cfg.EnableGRPC {
+		e = engine.New(reg, lManager, rStream, mach, nil)
+	} else {
+		regMux := genericReg.(*rpc.RegistryMux)
+		e = engine.New(reg, lManager, rStream, mach, regMux.EngineChanged)
+		if cfg.DisableEngine {
+			go regMux.ConnectToRegistry(e)
+		}
+	}
+
+	if len(listeners) == 0 {
+		listeners, err = activation.Listeners(false)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	hrt := heart.New(reg, mach)
+	mon := NewMonitor(agentTTL)
+
+	apiServer := api.NewServer(listeners, api.NewServeMux(reg, cfg.TokenLimit))
+	apiServer.Serve()
+
+	eIval := time.Duration(cfg.EngineReconcileInterval*1000) * time.Millisecond
+
+	srv := Server{
+		agent:       a,
+		aReconciler: ar,
+		usGen:       gen,
+		usPub:       pub,
+		engine:      e,
+		mach:        mach,
+		hrt:         hrt,
+		mon:         mon,
+		api:         apiServer,
+		killc:       make(chan struct{}),
+		stopc:       nil,
+		engineReconcileInterval: eIval,
+		disableEngine:           cfg.DisableEngine,
+		reconfigServer:          false,
+		restartServer:           false,
+	}
+
+	return &srv, nil
 }
 
-func newEtcdClientFromConfig(cfg config.Config) *etcd.Client {
-	c := etcd.NewClient(cfg.EtcdServers)
-	c.SetConsistency(etcd.STRONG_CONSISTENCY)
-	return c
-}
-
-func newRegistryEventStreamFromConfig(cfg config.Config) (*registry.EventStream, error) {
-	eClient := newEtcdClientFromConfig(cfg)
-	reg := registry.New(eClient, cfg.EtcdKeyPrefix)
-	return registry.NewEventStream(eClient, reg)
-}
-
-func newMachineFromConfig(cfg config.Config) (*machine.CoreOSMachine, error) {
+func newMachineFromConfig(cfg config.Config, mgr unit.UnitManager) (*machine.CoreOSMachine, error) {
 	state := machine.MachineState{
-		PublicIP: cfg.PublicIP,
-		Metadata: cfg.Metadata(),
-		Version:  version.Version,
+		PublicIP:     cfg.PublicIP,
+		Metadata:     cfg.Metadata(),
+		Capabilities: cfg.Capabilities(),
+		Version:      version.Version,
 	}
 
-	mach := machine.NewCoreOSMachine(state)
+	mach := machine.NewCoreOSMachine(state, mgr)
 	mach.Refresh()
 
 	if mach.State().ID == "" {
@@ -104,53 +202,125 @@ func newMachineFromConfig(cfg config.Config) (*machine.CoreOSMachine, error) {
 	return mach, nil
 }
 
-func newAgentFromConfig(mach machine.Machine, cfg config.Config, mgr unit.UnitManager) (*agent.Agent, error) {
-	regClient := newEtcdClientFromConfig(cfg)
-	reg := registry.New(regClient, cfg.EtcdKeyPrefix)
-
-	var verifier *sign.SignatureVerifier
-	if cfg.VerifyUnits {
-		var err error
-		verifier, err = sign.NewSignatureVerifierFromAuthorizedKeysFile(cfg.AuthorizedKeysFile)
-		if err != nil {
-			log.Errorln("Failed to get any key from authorized key file in verify_units mode:", err)
-			verifier = sign.NewSignatureVerifier()
-		}
-	}
-
-	return agent.New(mgr, reg, mach, cfg.AgentTTL, verifier)
-}
-
-func newEngineFromConfig(mach machine.Machine, cfg config.Config) (*engine.Engine, error) {
-	regClient := newEtcdClientFromConfig(cfg)
-	reg := registry.New(regClient, cfg.EtcdKeyPrefix)
-	return engine.New(reg, mach), nil
-}
-
 func (s *Server) Run() {
-	idx := s.agent.Initialize()
+	log.Infof("Establishing etcd connectivity")
 
-	asyncDispatch := func(ev *event.Event) {
-		go s.eBus.Dispatch(ev)
+	var err error
+	for sleep := time.Second; ; sleep = pkg.ExpBackoff(sleep, time.Minute) {
+		if s.restartServer {
+			_, err = s.hrt.Beat(s.mon.TTL)
+			if err == nil {
+				log.Infof("hrt.Beat() success")
+				break
+			}
+		} else {
+			_, err = s.hrt.Register(s.mon.TTL)
+			if err == nil {
+				log.Infof("hrt.Register() success")
+				break
+			}
+		}
+		log.Warningf("Server register machine failed: %v, retrying in %d sec.", err, sleep)
+		time.Sleep(sleep)
 	}
 
-	s.stop = make(chan bool)
-	go s.mach.PeriodicRefresh(machineStateRefreshInterval, s.stop)
-	go s.rStream.Stream(idx, asyncDispatch, s.stop)
-	go s.sStream.Stream(asyncDispatch, s.stop)
-	go s.agent.Heartbeat(s.stop)
+	go s.Supervise()
 
-	s.engine.CheckForWork()
+	log.Infof("Starting server components")
+	s.stopc = make(chan struct{})
+	s.wg = sync.WaitGroup{}
+	beatc := make(chan *unit.UnitStateHeartbeat)
+
+	components := []func(){
+		func() { s.api.Available(s.stopc) },
+		func() { s.mach.PeriodicRefresh(machineStateRefreshInterval, s.stopc) },
+		func() { s.agent.Heartbeat(s.stopc) },
+		func() { s.aReconciler.Run(s.agent, s.stopc) },
+		func() { s.usGen.Run(beatc, s.stopc) },
+		func() { s.usPub.Run(beatc, s.stopc) },
+	}
+	if s.disableEngine {
+		log.Info("Not starting engine; disable-engine is set")
+	} else {
+		components = append(components, func() { s.engine.Run(s.engineReconcileInterval, s.stopc) })
+	}
+	for _, f := range components {
+		f := f
+		s.wg.Add(1)
+		go func() {
+			f()
+			s.wg.Done()
+		}()
+	}
 }
 
-func (s *Server) Stop() {
-	close(s.stop)
+// Supervise monitors the life of the Server and coordinates its shutdown.
+// A shutdown occurs when the monitor returns, either because a health check
+// fails or a user triggers a shutdown. If the shutdown is due to a health
+// check failure, the Server is restarted. Supervise will block shutdown until
+// all components have finished shutting down or a timeout occurs; if this
+// happens, the Server will not automatically be restarted.
+func (s *Server) Supervise() {
+	sd, err := s.mon.Monitor(s.hrt, s.killc)
+	if sd {
+		log.Infof("Server monitor triggered: told to shut down")
+	} else {
+		log.Errorf("Server monitor triggered: %v", err)
+	}
+	close(s.stopc)
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownTimeout):
+		log.Errorf("Timed out waiting for server to shut down. Panicking the server without cleanup.")
+		panic("Failed server shutdown. Panic")
+	}
+	if !sd {
+		log.Infof("Restarting server")
+		s.SetRestartServer(true)
+		s.Run()
+		s.SetRestartServer(false)
+	}
+}
+
+// Kill is used to gracefully terminate the server by triggering the Monitor to shut down
+func (s *Server) Kill() {
+	if !s.reconfigServer {
+		close(s.killc)
+	}
 }
 
 func (s *Server) Purge() {
-	s.agent.Purge()
+	s.aReconciler.Purge(s.agent)
+	s.usPub.Purge()
+	s.engine.Purge()
+	s.hrt.Clear()
 }
 
 func (s *Server) MarshalJSON() ([]byte, error) {
-	return json.Marshal(struct{ Agent *agent.Agent }{Agent: s.agent})
+	return json.Marshal(struct {
+		Agent              *agent.Agent
+		UnitStatePublisher *agent.UnitStatePublisher
+		UnitStateGenerator *unit.UnitStateGenerator
+	}{
+		Agent:              s.agent,
+		UnitStatePublisher: s.usPub,
+		UnitStateGenerator: s.usGen,
+	})
+}
+
+func (s *Server) GetApiServerListeners() []net.Listener {
+	return s.api.GetListeners()
+}
+
+func (s *Server) SetReconfigServer(isReconfigServer bool) {
+	s.reconfigServer = isReconfigServer
+}
+
+func (s *Server) SetRestartServer(isRestartServer bool) {
+	s.restartServer = isRestartServer
 }

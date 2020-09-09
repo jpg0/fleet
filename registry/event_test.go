@@ -1,70 +1,94 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package registry
 
 import (
+	"reflect"
 	"testing"
 
-	"github.com/coreos/fleet/third_party/github.com/coreos/go-etcd/etcd"
+	etcd "github.com/coreos/etcd/client"
 
-	"github.com/coreos/fleet/event"
+	"github.com/coreos/fleet/pkg"
 )
 
-func TestPipe(t *testing.T) {
-	etcdchan := make(chan *etcd.Response)
-
-	translate1 := func(resp *etcd.Response) *event.Event {
-		return &event.Event{"TranslateTest1", resp.Action, nil}
+func TestFilterEtcdEvents(t *testing.T) {
+	tests := []struct {
+		in string
+		ev pkg.Event
+		ok bool
+	}{
+		{
+			in: "",
+			ok: false,
+		},
+		{
+			in: "/",
+			ok: false,
+		},
+		{
+			in: "/fleet",
+			ok: false,
+		},
+		{
+			in: "/fleet/job",
+			ok: false,
+		},
+		{
+			in: "/fleet/job/foo/object",
+			ok: false,
+		},
+		{
+			in: "/fleet/machine/asdf",
+			ok: false,
+		},
+		{
+			in: "/fleet/state/asdf",
+			ok: false,
+		},
+		{
+			in: "/fleet/job/foobarbaz/target-state",
+			ev: JobTargetStateChangeEvent,
+			ok: true,
+		},
+		{
+			in: "/fleet/job/asdf/target",
+			ev: JobTargetChangeEvent,
+			ok: true,
+		},
 	}
 
-	translate2 := func(resp *etcd.Response) *event.Event {
-		return &event.Event{"TranslateTest2", resp.Action, "foo"}
-	}
+	for i, tt := range tests {
+		for _, action := range []string{"set", "update", "create", "delete"} {
+			prefix := "/fleet"
 
-	filters := []func(resp *etcd.Response) *event.Event{translate1, translate2}
+			res := &etcd.Response{
+				Node: &etcd.Node{
+					Key: tt.in,
+				},
+				Action: action,
+			}
+			ev, ok := parse(res, prefix)
+			if ok != tt.ok {
+				t.Errorf("case %d: expected ok=%t, got %t", i, tt.ok, ok)
+				continue
+			}
 
-	eventchan := make(chan *event.Event)
-	stopchan := make(chan bool)
-
-	send := func(ev *event.Event) {
-		eventchan <- ev
-	}
-
-	go pipe(etcdchan, filters, send, stopchan)
-
-	resp := etcd.Response{Action: "TestAction", Node: &etcd.Node{Key: "/", ModifiedIndex: 0}}
-	etcdchan <- &resp
-
-	ev1 := <-eventchan
-	ev2 := <-eventchan
-
-	close(stopchan)
-
-	if ev1.Type != "TranslateTest1" {
-		t.Fatalf("Expected ev1.Type \"TranslateTest1\" but got %q", ev1.Type)
-	}
-
-	if ev1.Payload.(string) != "TestAction" {
-		t.Fatalf("Expected ev1.Payload \"TestAction\", but got something else")
-	}
-
-	if ev1.Context != nil {
-		t.Fatalf("Expected ev1.Context be nil")
-	}
-
-	if ev2.Type != "TranslateTest2" {
-		t.Fatalf("Expected ev2.Type \"TranslateTest2\" but got %q", ev2.Type)
-	}
-
-	payload := ev2.Payload.(string)
-	if payload != "TestAction" {
-		t.Fatalf("Expected ev2.Payload \"TestAction\", but got %q", payload)
-	}
-
-	if ev2.Context == nil {
-		t.Fatalf("Expected ev2.Context to be non-nil")
-	}
-
-	ctx := ev2.Context.(string)
-	if ctx != "foo" {
-		t.Fatalf("Expected ev2.Context value \"foo\", got %q", ctx)
+			if !reflect.DeepEqual(tt.ev, ev) {
+				t.Errorf("case %d: received incorrect event\nexpected %#v\ngot %#v", i, tt.ev, ev)
+				t.Logf("action: %v", action)
+			}
+		}
 	}
 }

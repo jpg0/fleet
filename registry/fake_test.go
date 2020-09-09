@@ -1,3 +1,17 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package registry
 
 import (
@@ -8,44 +22,58 @@ import (
 	"github.com/coreos/fleet/unit"
 )
 
-func TestFakeRegistryJobLifecycle(t *testing.T) {
+func TestFakeRegistryUnitLifecycle(t *testing.T) {
 	reg := NewFakeRegistry()
 
-	jobs, err := reg.GetAllJobs()
+	units, err := reg.Units()
 	if err != nil {
-		t.Fatalf("Received error while calling GetAllJobs: %v", err)
+		t.Fatalf("Received error while calling Jobs: %v", err)
 	}
-	if !reflect.DeepEqual([]job.Job{}, jobs) {
-		t.Fatalf("Expected no jobs, got %v", jobs)
+	if !reflect.DeepEqual([]job.Unit{}, units) {
+		t.Fatalf("Expected no units, got %v", units)
 	}
 
-	j1 := job.NewJob("job1.service", *unit.NewUnit(""))
-	err = reg.CreateJob(j1)
+	uf, _ := unit.NewUnitFile("")
+	u1 := job.Unit{Name: "u1.service", Unit: *uf, TargetState: job.JobStateLoaded}
+	err = reg.CreateUnit(&u1)
 	if err != nil {
-		t.Fatalf("Received error while calling CreateJob: %v", err)
+		t.Fatalf("Received error while calling CreateUnit: %v", err)
 	}
 
-	jobs, err = reg.GetAllJobs()
+	units, err = reg.Units()
 	if err != nil {
-		t.Fatalf("Received error while calling GetAllJobs: %v", err)
+		t.Fatalf("Received error while calling Units: %v", err)
 	}
-	if len(jobs) != 1 {
-		t.Fatalf("Expected 1 Job, got %v", jobs)
+	if len(units) != 1 {
+		t.Fatalf("Expected 1 Unit, got %v", units)
 	}
-	if jobs[0].Name != "job1.service" {
-		t.Fatalf("Expected Job with name \"job1.service\", got %q", jobs[0].Name)
+	if !reflect.DeepEqual(u1, units[0]) {
+		t.Fatalf("Expected unit %v, got %v", u1, units[0])
 	}
 
-	err = reg.DestroyJob("job1.service")
+	err = reg.ScheduleUnit("u1.service", "XXX")
 	if err != nil {
-		t.Fatalf("Received error while calling DestroyJob: %v", err)
+		t.Fatalf("Received error while calling ScheduleUnit: %v", err)
 	}
 
-	jobs, err = reg.GetAllJobs()
+	su, err := reg.ScheduledUnit("u1.service")
 	if err != nil {
-		t.Fatalf("Received error while calling GetAllJobs: %v", err)
+		t.Fatalf("Received error while calling ScheduledUnit: %v", err)
 	}
-	if !reflect.DeepEqual([]job.Job{}, jobs) {
-		t.Fatalf("Expected no jobs, got %v", jobs)
+	if su.TargetMachineID != "XXX" {
+		t.Fatalf("Unit should be scheduled to XXX, got %v", su.TargetMachineID)
+	}
+
+	err = reg.DestroyUnit("u1.service")
+	if err != nil {
+		t.Fatalf("Received error while calling DestroyUnit: %v", err)
+	}
+
+	units, err = reg.Units()
+	if err != nil {
+		t.Fatalf("Received error while calling Units: %v", err)
+	}
+	if !reflect.DeepEqual([]job.Unit{}, units) {
+		t.Fatalf("Expected no units, got %v", units)
 	}
 }

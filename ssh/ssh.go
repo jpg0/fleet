@@ -1,3 +1,17 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package ssh
 
 import (
@@ -8,18 +22,22 @@ import (
 	"strings"
 	"time"
 
-	gossh "github.com/coreos/fleet/third_party/code.google.com/p/gosshnew/ssh"
-	gosshagent "github.com/coreos/fleet/third_party/code.google.com/p/gosshnew/ssh/agent"
-	"github.com/coreos/fleet/third_party/code.google.com/p/gosshnew/ssh/terminal"
+	gossh "golang.org/x/crypto/ssh"
+	gosshagent "golang.org/x/crypto/ssh/agent"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 type SSHForwardingClient struct {
 	agentForwarding bool
 	*gossh.Client
+	authAgentReqSent bool
 }
 
 func (s *SSHForwardingClient) ForwardAgentAuthentication(session *gossh.Session) error {
-	if s.agentForwarding {
+	if s.agentForwarding && !s.authAgentReqSent {
+		// We are allowed to send "auth-agent-req@openssh.com" request only once per channel
+		// otherwise ssh daemon replies with the "SSH2_MSG_CHANNEL_FAILURE 100"
+		s.authAgentReqSent = true
 		return gosshagent.RequestAgentForwarding(session)
 	}
 	return nil
@@ -36,7 +54,7 @@ func newSSHForwardingClient(client *gossh.Client, agentForwarding bool) (*SSHFor
 		return nil, err
 	}
 
-	return &SSHForwardingClient{agentForwarding, client}, nil
+	return &SSHForwardingClient{agentForwarding, client, false}, nil
 }
 
 // makeSession initializes a gossh.Session connected to the invoking process's stdout/stderr/stdout.
@@ -142,7 +160,7 @@ func Shell(client *SSHForwardingClient) error {
 func SSHAgentClient() (gosshagent.Agent, error) {
 	sock := os.Getenv("SSH_AUTH_SOCK")
 	if sock == "" {
-		return nil, errors.New("SSH_AUTH_SOCK environment variable is not set. Verify ssh-agent is running. See https://github.com/coreos/fleet/blob/master/Documentation/remote-access.md for help.")
+		return nil, errors.New("SSH_AUTH_SOCK environment variable is not set. Verify ssh-agent is running. See https://github.com/coreos/fleet/blob/master/Documentation/using-the-client.md for help.")
 	}
 
 	agent, err := net.Dial("unix", sock)
@@ -153,7 +171,7 @@ func SSHAgentClient() (gosshagent.Agent, error) {
 	return gosshagent.NewClient(agent), nil
 }
 
-func sshClientConfig(user string, checker *HostKeyChecker) (*gossh.ClientConfig, error) {
+func sshClientConfig(user string, checker *HostKeyChecker, addr string) (*gossh.ClientConfig, error) {
 	agentClient, err := SSHAgentClient()
 	if err != nil {
 		return nil, err
@@ -173,6 +191,7 @@ func sshClientConfig(user string, checker *HostKeyChecker) (*gossh.ClientConfig,
 
 	if checker != nil {
 		cfg.HostKeyCallback = checker.Check
+		cfg.HostKeyAlgorithms = checker.GetHostKeyAlgorithms(addr)
 	}
 
 	return &cfg, nil
@@ -185,13 +204,13 @@ func maybeAddDefaultPort(addr string) string {
 	return net.JoinHostPort(addr, strconv.Itoa(sshDefaultPort))
 }
 
-func NewSSHClient(user, addr string, checker *HostKeyChecker, agentForwarding bool) (*SSHForwardingClient, error) {
-	clientConfig, err := sshClientConfig(user, checker)
+func NewSSHClient(user, addr string, checker *HostKeyChecker, agentForwarding bool, timeout time.Duration) (*SSHForwardingClient, error) {
+	addr = maybeAddDefaultPort(addr)
+
+	clientConfig, err := sshClientConfig(user, checker, addr)
 	if err != nil {
 		return nil, err
 	}
-
-	addr = maybeAddDefaultPort(addr)
 
 	var client *gossh.Client
 	dialFunc := func(echan chan error) {
@@ -199,7 +218,7 @@ func NewSSHClient(user, addr string, checker *HostKeyChecker, agentForwarding bo
 		client, err = gossh.Dial("tcp", addr, clientConfig)
 		echan <- err
 	}
-	err = timeoutSSHDial(dialFunc)
+	err = timeoutSSHDial(dialFunc, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -207,14 +226,14 @@ func NewSSHClient(user, addr string, checker *HostKeyChecker, agentForwarding bo
 	return newSSHForwardingClient(client, agentForwarding)
 }
 
-func NewTunnelledSSHClient(user, tunaddr, tgtaddr string, checker *HostKeyChecker, agentForwarding bool) (*SSHForwardingClient, error) {
-	clientConfig, err := sshClientConfig(user, checker)
+func NewTunnelledSSHClient(user, tunaddr, tgtaddr string, checker *HostKeyChecker, agentForwarding bool, timeout time.Duration) (*SSHForwardingClient, error) {
+	tunaddr = maybeAddDefaultPort(tunaddr)
+	tgtaddr = maybeAddDefaultPort(tgtaddr)
+
+	clientConfig, err := sshClientConfig(user, checker, tunaddr)
 	if err != nil {
 		return nil, err
 	}
-
-	tunaddr = maybeAddDefaultPort(tunaddr)
-	tgtaddr = maybeAddDefaultPort(tgtaddr)
 
 	var tunnelClient *gossh.Client
 	dialFunc := func(echan chan error) {
@@ -222,7 +241,7 @@ func NewTunnelledSSHClient(user, tunaddr, tgtaddr string, checker *HostKeyChecke
 		tunnelClient, err = gossh.Dial("tcp", tunaddr, clientConfig)
 		echan <- err
 	}
-	err = timeoutSSHDial(dialFunc)
+	err = timeoutSSHDial(dialFunc, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +256,7 @@ func NewTunnelledSSHClient(user, tunaddr, tgtaddr string, checker *HostKeyChecke
 		targetConn, err = tunnelClient.DialTCP("tcp", nil, tgtTCPAddr)
 		echan <- err
 	}
-	err = timeoutSSHDial(dialFunc)
+	err = timeoutSSHDial(dialFunc, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -249,14 +268,14 @@ func NewTunnelledSSHClient(user, tunaddr, tgtaddr string, checker *HostKeyChecke
 	return newSSHForwardingClient(gossh.NewClient(c, chans, reqs), agentForwarding)
 }
 
-func timeoutSSHDial(dial func(chan error)) error {
+func timeoutSSHDial(dial func(chan error), timeout time.Duration) error {
 	var err error
 
 	echan := make(chan error)
 	go dial(echan)
 
 	select {
-	case <-time.After(time.Duration(time.Second * 10)):
+	case <-time.After(timeout):
 		return errors.New("timed out while initiating SSH connection")
 	case err = <-echan:
 		return err

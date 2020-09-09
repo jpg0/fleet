@@ -1,163 +1,152 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package main
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
-	"github.com/coreos/fleet/job"
+	"github.com/spf13/cobra"
+
+	"github.com/coreos/fleet/machine"
+	"github.com/coreos/fleet/schema"
 )
 
 const (
-	defaultListUnitsFields = "unit,state,load,active,sub,desc,machine"
+	defaultListUnitsFields = "unit,machine,active,sub"
 )
 
 var (
 	listUnitsFieldsFlag string
-	cmdListUnits        = &Command{
-		Name:    "list-units",
-		Summary: "Enumerate units loaded in the cluster",
-		Usage:   "[--no-legend] [-l|--full]",
-		Description: `Lists all units submitted or started on the cluster.
-
-For easily parsable output, you can remove the column headers:
-	fleetctl list-units --no-legend
-
-Output the list without ellipses:
-	fleetctl list-units --full
-
-Or, choose the columns to display:
-	fleetctl list-units --fields=unit,machine`,
-		Run: runListUnits,
-	}
-
-	listUnitsFields = map[string]jobToField{
-		"unit": func(j *job.Job, full bool) string {
-			return j.Name
-		},
-		"state": func(j *job.Job, full bool) string {
-			js := j.State
-			if js != nil {
-				return string(*js)
-			}
-			return "-"
-		},
-		"load": func(j *job.Job, full bool) string {
-			us := j.UnitState
+	listUnitsFields     = map[string]usToField{
+		"unit": func(us *schema.UnitState, full bool) string {
 			if us == nil {
 				return "-"
 			}
-			return us.LoadState
+			return us.Name
 		},
-		"active": func(j *job.Job, full bool) string {
-			us := j.UnitState
+		"load": func(us *schema.UnitState, full bool) string {
 			if us == nil {
 				return "-"
 			}
-			return us.ActiveState
+			return us.SystemdLoadState
 		},
-		"sub": func(j *job.Job, full bool) string {
-			us := j.UnitState
+		"active": func(us *schema.UnitState, full bool) string {
 			if us == nil {
 				return "-"
 			}
-			return us.SubState
+			return us.SystemdActiveState
 		},
-		"desc": func(j *job.Job, full bool) string {
-			d := j.Unit.Description()
-			if d == "" {
+		"sub": func(us *schema.UnitState, full bool) string {
+			if us == nil {
 				return "-"
 			}
-			return d
+			return us.SystemdSubState
 		},
-		"machine": func(j *job.Job, full bool) string {
-			us := j.UnitState
-			if us == nil || us.MachineState == nil {
+		"machine": func(us *schema.UnitState, full bool) string {
+			if us == nil || us.MachineID == "" {
 				return "-"
 			}
-			return machineFullLegend(*us.MachineState, full)
+			ms := cachedMachineState(us.MachineID)
+			if ms == nil {
+				ms = &machine.MachineState{ID: us.MachineID}
+			}
+			return machineFullLegend(*ms, full)
 		},
-		"hash": func(j *job.Job, full bool) string {
+		"hash": func(us *schema.UnitState, full bool) string {
+			if us == nil || us.Hash == "" {
+				return "-"
+			}
 			if !full {
-				return j.UnitHash.Short()
+				return us.Hash[:7]
 			}
-			return j.UnitHash.String()
+			return us.Hash
 		},
 	}
 )
 
-type jobToField func(j *job.Job, full bool) string
+type usToField func(us *schema.UnitState, full bool) string
 
-func init() {
-	cmdListUnits.Flags.BoolVar(&sharedFlags.Full, "full", false, "Do not ellipsize fields on output")
-	cmdListUnits.Flags.BoolVar(&sharedFlags.Full, "l", false, "Shorthand for --full")
-	cmdListUnits.Flags.BoolVar(&sharedFlags.NoLegend, "no-legend", false, "Do not print a legend (column headers)")
-	cmdListUnits.Flags.StringVar(&listUnitsFieldsFlag, "fields", defaultListUnitsFields, fmt.Sprintf("Columns to print for each Unit. Valid fields are %q", strings.Join(jobToFieldKeys(listUnitsFields), ",")))
+var cmdListUnits = &cobra.Command{
+	Use:   "list-units [--no-legend] [-l|--full] [--fields]",
+	Short: "List the current state of units in the cluster",
+	Long: `Lists the state of all units in the cluster loaded onto a machine.
+
+For easily parsable output, you can remove the column headers:
+fleetctl list-units --no-legend
+
+Output the list without ellipses:
+fleetctl list-units --full
+
+Or, choose the columns to display:
+fleetctl list-units --fields=unit,machine`,
+	Run: runWrapper(runListUnits),
 }
 
-func runListUnits(args []string) (exit int) {
+func init() {
+	cmdFleet.AddCommand(cmdListUnits)
 
+	cmdListUnits.Flags().BoolVar(&sharedFlags.Full, "full", false, "Do not ellipsize fields on output")
+	cmdListUnits.Flags().BoolVar(&sharedFlags.Full, "l", false, "Shorthand for --full")
+	cmdListUnits.Flags().BoolVar(&sharedFlags.NoLegend, "no-legend", false, "Do not print a legend (column headers)")
+	cmdListUnits.Flags().StringVar(&listUnitsFieldsFlag, "fields", defaultListUnitsFields, fmt.Sprintf("Columns to print for each Unit. Valid fields are %q", strings.Join(usToFieldKeys(listUnitsFields), ",")))
+}
+
+func runListUnits(cCmd *cobra.Command, args []string) (exit int) {
 	if listUnitsFieldsFlag == "" {
-		fmt.Fprintf(os.Stderr, "Must define output format\n")
+		stderr("Must define output format")
 		return 1
 	}
 
 	cols := strings.Split(listUnitsFieldsFlag, ",")
 	for _, s := range cols {
 		if _, ok := listUnitsFields[s]; !ok {
-			fmt.Fprintf(os.Stderr, "Invalid key in output format: %q\n", s)
+			stderr("Invalid key in output format: %q", s)
 			return 1
 		}
 	}
 
-	jobs, sortable, err := findAllUnits()
-
+	states, err := cAPI.UnitStates()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error retrieving list of units from repository: %v\n", err)
+		stderr("Error retrieving list of units from repository: %v", err)
 		return 1
 	}
 
-	if !sharedFlags.NoLegend {
+	noLegend, _ := cCmd.Flags().GetBool("no-legend")
+	if !noLegend {
 		fmt.Fprintln(out, strings.ToUpper(strings.Join(cols, "\t")))
 	}
 
-	for _, name := range sortable {
+	full, _ := cCmd.Flags().GetBool("full")
+	for _, us := range states {
 		var f []string
-		j := jobs[name]
 		for _, c := range cols {
-			f = append(f, listUnitsFields[c](&j, sharedFlags.Full))
+			f = append(f, listUnitsFields[c](us, full))
 		}
 		fmt.Fprintln(out, strings.Join(f, "\t"))
 	}
 
 	out.Flush()
-	return
+	return 0
 }
 
-// findAllUnits returns a map describing all the Jobs in the Registry, and a
-// sort.StringSlice containing their names in sorted order.
-// It returns any error encountered in communicating with the Registry.
-func findAllUnits() (jobs map[string]job.Job, sortable sort.StringSlice, err error) {
-	jobs = make(map[string]job.Job, 0)
-	jj, err := registryCtl.GetAllJobs()
-	if err != nil {
-		return
-	}
-
-	for _, j := range jj {
-		jobs[j.Name] = j
-		sortable = append(sortable, j.Name)
-	}
-
-	sortable.Sort()
-
-	return
-}
-
-func jobToFieldKeys(m map[string]jobToField) (keys []string) {
-	for k, _ := range m {
+func usToFieldKeys(m map[string]usToField) (keys []string) {
+	for k := range m {
 		keys = append(keys, k)
 	}
+	sort.Strings(keys)
 	return
 }

@@ -1,80 +1,76 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package registry
 
 import (
-	"path"
 	"strings"
 	"time"
 
-	"github.com/coreos/fleet/third_party/github.com/coreos/go-etcd/etcd"
+	etcd "github.com/coreos/etcd/client"
+	"golang.org/x/net/context"
 
-	"github.com/coreos/fleet/event"
 	"github.com/coreos/fleet/machine"
+	"path"
 )
 
 const (
 	machinePrefix = "machines"
 )
 
-// Describe all active Machines
-func (r *EtcdRegistry) GetActiveMachines() (machines []machine.MachineState, err error) {
-	key := path.Join(r.keyPrefix, machinePrefix)
-	resp, err := r.etcd.Get(key, false, true)
+func (r *EtcdRegistry) Machines() (machines []machine.MachineState, err error) {
+	key := r.prefixed(machinePrefix)
+	opts := &etcd.GetOptions{
+		Sort:      true,
+		Recursive: true,
+	}
 
+	resp, err := r.kAPI.Get(context.Background(), key, opts)
 	if err != nil {
-		if isKeyNotFound(err) {
+		if isEtcdError(err, etcd.ErrorCodeKeyNotFound) {
 			err = nil
 		}
 		return
 	}
 
-	for _, kv := range resp.Node.Nodes {
-		_, machID := path.Split(kv.Key)
-		mach, _ := r.GetMachineState(machID)
-		if mach != nil {
-			machines = append(machines, *mach)
+	for _, node := range resp.Node.Nodes {
+		var mach machine.MachineState
+		mach, err = readMachineState(node)
+		if err != nil {
+			return
+		}
+
+		if mach.ID != "" {
+			machines = append(machines, mach)
 		}
 	}
 
 	return
 }
 
-// Get Machine object from etcd
-func (r *EtcdRegistry) GetMachineState(machID string) (*machine.MachineState, error) {
-	key := path.Join(r.keyPrefix, machinePrefix, machID, "object")
-	resp, err := r.etcd.Get(key, false, true)
-
-	if err != nil {
-		if isKeyNotFound(err) {
-			err = nil
-		}
-		return nil, err
-	}
-
-	var mach machine.MachineState
-	if err := unmarshal(resp.Node.Value, &mach); err != nil {
-		return nil, err
-	}
-
-	return &mach, nil
-}
-
-// Push Machine object to etcd
-func (r *EtcdRegistry) SetMachineState(ms machine.MachineState, ttl time.Duration) (uint64, error) {
-	json, err := marshal(ms)
+func (r *EtcdRegistry) CreateMachineState(ms machine.MachineState, ttl time.Duration) (uint64, error) {
+	val, err := marshal(ms)
 	if err != nil {
 		return uint64(0), err
 	}
-	key := path.Join(r.keyPrefix, machinePrefix, ms.ID, "object")
 
-	// Assume state is already present, returning on success
-	resp, err := r.etcd.Update(key, json, uint64(ttl.Seconds()))
-	if err == nil {
-		return resp.Node.ModifiedIndex, nil
+	key := r.prefixed(machinePrefix, ms.ID, "object")
+	opts := &etcd.SetOptions{
+		PrevExist: etcd.PrevNoExist,
+		TTL:       ttl,
 	}
-
-	// If state was not present, explicitly create it so the other members
-	// in the cluster know this is a new member
-	resp, err = r.etcd.Create(key, json, uint64(ttl.Seconds()))
+	resp, err := r.kAPI.Set(context.Background(), key, val, opts)
 	if err != nil {
 		return uint64(0), err
 	}
@@ -82,62 +78,116 @@ func (r *EtcdRegistry) SetMachineState(ms machine.MachineState, ttl time.Duratio
 	return resp.Node.ModifiedIndex, nil
 }
 
-// Remove Machine object from etcd
+func (r *EtcdRegistry) SetMachineState(ms machine.MachineState, ttl time.Duration) (uint64, error) {
+	val, err := marshal(ms)
+	if err != nil {
+		return uint64(0), err
+	}
+
+	key := r.prefixed(machinePrefix, ms.ID, "object")
+	opts := &etcd.SetOptions{
+		PrevExist: etcd.PrevExist,
+		TTL:       ttl,
+	}
+	resp, err := r.kAPI.Set(context.Background(), key, val, opts)
+	if err == nil {
+		return resp.Node.ModifiedIndex, nil
+	}
+
+	// If state was not present, explicitly create it so the other members
+	// in the cluster know this is a new member
+	opts.PrevExist = etcd.PrevNoExist
+
+	resp, err = r.kAPI.Set(context.Background(), key, val, opts)
+	if err != nil {
+		return uint64(0), err
+	}
+
+	return resp.Node.ModifiedIndex, nil
+}
+
+func (r *EtcdRegistry) MachineState(machID string) (machine.MachineState, error) {
+	key := path.Join(r.keyPrefix, machinePrefix, machID)
+	opts := &etcd.GetOptions{
+		Recursive: true,
+		Sort:      true,
+	}
+
+	resp, err := r.kAPI.Get(context.Background(), key, opts)
+	if err != nil {
+		return machine.MachineState{}, err
+	}
+
+	return readMachineState(resp.Node)
+}
+
+func (r *EtcdRegistry) SetMachineMetadata(machID string, key string, value string) error {
+	key = path.Join(r.keyPrefix, machinePrefix, machID, "metadata", key)
+	opts := &etcd.SetOptions{}
+	_, err := r.kAPI.Set(context.Background(), key, value, opts)
+	return err
+}
+
+func (r *EtcdRegistry) DeleteMachineMetadata(machID string, key string) error {
+	// Deleting a key sets its value to "" to allow for intelligent merging
+	// between the machine-defined metadata and the dynamic metadata.
+	// See mergeMetadata for more detail.
+	return r.SetMachineMetadata(machID, key, "")
+}
+
 func (r *EtcdRegistry) RemoveMachineState(machID string) error {
-	key := path.Join(r.keyPrefix, machinePrefix, machID, "object")
-	_, err := r.etcd.Delete(key, false)
-	if isKeyNotFound(err) {
+	key := r.prefixed(machinePrefix, machID, "object")
+	_, err := r.kAPI.Delete(context.Background(), key, nil)
+	if isEtcdError(err, etcd.ErrorCodeKeyNotFound) {
 		err = nil
 	}
 	return err
 }
 
-// Attempt to acquire a lock on a given machine for a given amount of time
-func (r *EtcdRegistry) LockMachine(machID, context string) *TimedResourceMutex {
-	return r.lockResource("machine", machID, context)
+// mergeMetadata merges the machine-set metadata with the dynamic metadata to better facilitate
+// machines leaving and rejoining a cluster.
+// Merging metadata uses the following rules:
+// - Any keys that are only in one collection are added as-is
+// - Any keys that exist in both, the dynamic value takes precence
+// - Any keys that have a zero-value string in the dynamic metadata are considered deleted
+//   and are not included in the final collection
+func mergeMetadata(machineMetadata, dynamicMetadata map[string]string) map[string]string {
+	if dynamicMetadata == nil {
+		return machineMetadata
+	}
+	finalMetadata := make(map[string]string, len(dynamicMetadata))
+	for k, v := range machineMetadata {
+		finalMetadata[k] = v
+	}
+	for k, v := range dynamicMetadata {
+		if v == "" {
+			delete(finalMetadata, k)
+		} else {
+			finalMetadata[k] = v
+		}
+	}
+	return finalMetadata
 }
 
-func filterEventMachineCreated(resp *etcd.Response) *event.Event {
-	dir, baseName := path.Split(resp.Node.Key)
-	if baseName != "object" {
-		return nil
+// readMachineState reads machine state from an etcd node
+func readMachineState(node *etcd.Node) (mach machine.MachineState, err error) {
+	var metadata map[string]string
+
+	for _, obj := range node.Nodes {
+		if strings.HasSuffix(obj.Key, "/object") {
+			err = unmarshal(obj.Value, &mach)
+			if err != nil {
+				return
+			}
+		} else if strings.HasSuffix(obj.Key, "/metadata") {
+			// Load metadata into a separate map to avoid stepping on it when deserializing the object key
+			metadata = make(map[string]string, len(obj.Nodes))
+			for _, mdnode := range obj.Nodes {
+				metadata[path.Base(mdnode.Key)] = mdnode.Value
+			}
+		}
 	}
 
-	dir = strings.TrimSuffix(dir, "/")
-	dir = path.Dir(dir)
-	prefixName := path.Base(dir)
-
-	if prefixName != machinePrefix {
-		return nil
-	}
-
-	if resp.Action != "create" {
-		return nil
-	}
-
-	var m machine.MachineState
-	unmarshal(resp.Node.Value, &m)
-	return &event.Event{"EventMachineCreated", m, nil}
-}
-
-func filterEventMachineRemoved(resp *etcd.Response) *event.Event {
-	dir, baseName := path.Split(resp.Node.Key)
-	if baseName != "object" {
-		return nil
-	}
-
-	dir = strings.TrimSuffix(dir, "/")
-	dir = path.Dir(dir)
-	prefixName := path.Base(dir)
-
-	if prefixName != machinePrefix {
-		return nil
-	}
-
-	if resp.Action != "expire" && resp.Action != "delete" {
-		return nil
-	}
-
-	machID := path.Base(path.Dir(resp.Node.Key))
-	return &event.Event{"EventMachineRemoved", machID, nil}
+	mach.Metadata = mergeMetadata(mach.Metadata, metadata)
+	return
 }

@@ -1,3 +1,17 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package functional
 
 import (
@@ -5,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/coreos/fleet/functional/platform"
+	"github.com/coreos/fleet/functional/util"
 )
 
 // Ensure an existing unit migrates to an unoccupied machine
@@ -14,36 +29,45 @@ func TestDynamicClusterNewMemberUnitMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cluster.Destroy()
+	defer cluster.Destroy(t)
 
 	// Start with a 4-node cluster
-	if err := platform.CreateNClusterMembers(cluster, 4, platform.MachineConfig{}); err != nil {
+	members, err := platform.CreateNClusterMembers(cluster, 4)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = cluster.WaitForNMachines(4); err != nil {
+	m0 := members[0]
+	if _, err = cluster.WaitForNMachines(m0, 4); err != nil {
 		t.Fatal(err)
 	}
 
 	// Start 3 conflicting units on the 4-node cluster
-	if _, _, err := cluster.Fleetctl("start",
+	stdout, stderr, err := cluster.Fleetctl(m0, "start",
 		"fixtures/units/conflict.0.service",
 		"fixtures/units/conflict.1.service",
 		"fixtures/units/conflict.2.service",
-	); err != nil {
-		t.Errorf("Failed starting units: %v", err)
+	)
+	if err != nil {
+		t.Errorf("Failed starting units: \nstdout: %s\nstderr: %s\nerr: %v", stdout, stderr, err)
 	}
 
 	// All 3 services should be visible immediately, and all of them should
 	// become ACTIVE shortly thereafter
-	stdout, _, err := cluster.Fleetctl("list-units", "--no-legend")
+	stdout, stderr, err = cluster.Fleetctl(m0, "list-units", "--no-legend")
 	if err != nil {
-		t.Fatalf("Failed to run list-units: %v", err)
+		t.Fatalf("Failed to run list-units:\nstdout: %s\nstderr: %s\nerr: %v", stdout, stderr, err)
 	}
 	units := strings.Split(strings.TrimSpace(stdout), "\n")
 	if len(units) != 3 {
 		t.Fatalf("Did not find 3 units in cluster: \n%s", stdout)
 	}
-	states, err := cluster.WaitForNActiveUnits(3)
+	active, err := cluster.WaitForNActiveUnits(m0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure each unit is only running on a single machine
+	states, err := util.ActiveToSingleStates(active)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,16 +75,31 @@ func TestDynamicClusterNewMemberUnitMigration(t *testing.T) {
 	// Kill one of the machines and make sure the unit migrates somewhere else
 	unit := "conflict.1.service"
 	oldMach := states[unit].Machine
-	if _, _, err = cluster.Fleetctl("--strict-host-key-checking=false", "ssh", oldMach, "sudo", "systemctl", "stop", "fleet"); err != nil {
+	stdout, stderr, err = cluster.Fleetctl(m0, "--strict-host-key-checking=false", "ssh", oldMach,
+		"sudo", "systemctl", "stop", "fleet")
+	if err != nil {
+		t.Fatalf("Failed to stop fleet service:\nstdout: %s\nstderr: %s\nerr: %v", stdout, stderr, err)
+	}
+	var mN platform.Member
+	if m0.ID() == oldMach {
+		mN = members[1]
+	} else {
+		mN = m0
+	}
+
+	if _, err = cluster.WaitForNMachines(mN, 3); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = cluster.WaitForNMachines(3); err != nil {
-		t.Fatal(err)
-	}
-	newStates, err := cluster.WaitForNActiveUnits(3)
+	newActive, err := cluster.WaitForNActiveUnits(mN, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Ensure each unit is only running on a single machine
+	newStates, err := util.ActiveToSingleStates(newActive)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	newMach := newStates[unit].Machine
 	if newMach == oldMach {
 		t.Fatalf("Unit %s did not migrate from machine %s to %s", unit, oldMach, newMach)
@@ -82,76 +121,70 @@ func TestDynamicClusterMemberReboot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cluster.Destroy()
+	defer cluster.Destroy(t)
 
 	// Start with a simple three-node cluster
-	if err := platform.CreateNClusterMembers(cluster, 3, platform.MachineConfig{}); err != nil {
+	members, err := platform.CreateNClusterMembers(cluster, 3)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = cluster.WaitForNMachines(3); err != nil {
+	m0 := members[0]
+	if _, err = cluster.WaitForNMachines(m0, 3); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, _, err := cluster.Fleetctl("start",
+	stdout, stderr, err := cluster.Fleetctl(m0, "start",
 		"fixtures/units/conflict.0.service",
 		"fixtures/units/conflict.1.service",
 		"fixtures/units/conflict.2.service",
-	); err != nil {
-		t.Errorf("Failed starting units: %v", err)
+	)
+	if err != nil {
+		t.Errorf("Failed starting units:\nstdout: %s\nstderr: %s\nerr: %v", stdout, stderr, err)
 	}
 
 	// All 3 services should be visible immediately, and all of them should
 	// become ACTIVE shortly thereafter
-	stdout, _, err := cluster.Fleetctl("list-units", "--no-legend")
+	stdout, stderr, err = cluster.Fleetctl(m0, "list-units", "--no-legend")
 	if err != nil {
-		t.Fatalf("Failed to run list-units: %v", err)
+		t.Fatalf("Failed to run list-units:\nstdout: %s\nstderr: %s\nerr: %v", stdout, stderr, err)
 	}
 	units := strings.Split(strings.TrimSpace(stdout), "\n")
 	if len(units) != 3 {
 		t.Fatalf("Did not find 3 units in cluster: \n%s", stdout)
 	}
-	oldStates, err := cluster.WaitForNActiveUnits(3)
+	oldActive, err := cluster.WaitForNActiveUnits(m0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldStates, err := util.ActiveToSingleStates(oldActive)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Simulate a reboot by recreating one of the cluster members
-	member := cluster.Members()[1]
-	if _, err = cluster.MemberCommand(member, "sudo", "systemctl", "stop", "fleet"); err != nil {
+	if _, err := cluster.ReplaceMember(cluster.Members()[1]); err != nil {
+		t.Fatalf("replace failed: %v", err)
+	}
+	newActive, err := cluster.WaitForNActiveUnits(m0, 3)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err = cluster.DestroyMember(member); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = cluster.WaitForNMachines(2); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = cluster.WaitForNActiveUnits(2); err != nil {
-		t.Fatal(err)
-	}
-	if err = cluster.CreateMember(member, platform.MachineConfig{}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = cluster.WaitForNMachines(3); err != nil {
-		t.Fatal(err)
-	}
-	newStates, err := cluster.WaitForNActiveUnits(3)
+	newStates, err := util.ActiveToSingleStates(newActive)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	found := false
+	migrated := 0
 	for _, unit := range []string{"conflict.0.service", "conflict.1.service", "conflict.2.service"} {
 		if oldStates[unit].Machine != newStates[unit].Machine {
-			if found {
-				t.Fatal("More than one unit migrated")
-			} else {
-				found = true
-			}
+			migrated += 1
 		}
 	}
 
-	if !found {
-		t.Fatal("Could not find migrated unit")
+	if migrated != 1 {
+		t.Errorf("Expected 1 unit to migrate, but found %d", migrated)
+		t.Logf("Initial state: %#v", oldStates)
+		t.Logf("Post-reboot state: %#v", newStates)
 	}
 }

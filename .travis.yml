@@ -1,8 +1,18 @@
 language: go
-go: 1.2
-
-install:
- - go get code.google.com/p/go.tools/cmd/cover
+matrix:
+  include:
+    - go: 1.5.x
+      env: GO15VENDOREXPERIMENT=1
+    - go: 1.6.x
+    - go: 1.7.x
+    - go: tip
+  allow_failures:
+    - go: tip
 
 script:
  - ./test
+
+notifications:
+  email: false
+
+sudo: false

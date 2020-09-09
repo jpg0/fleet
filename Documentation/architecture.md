@@ -1,79 +1,79 @@
 # Architecture
 
-There exist two primary roles within fleet: Engine and Agent. Each `fleet` daemon running in a cluster fulfills both roles. An Engine primarily makes scheduling decisions while an Agent executes jobs.
+**[fleet is no longer actively developed or maintained by CoreOS](https://coreos.com/blog/migrating-from-fleet-to-kubernetes.html). CoreOS instead recommends [Kubernetes](https://coreos.com/kubernetes/docs/latest/) for cluster orchestration.**
 
-## Moving Parts
+## fleetd
+
+Every system in the fleet cluster runs a single `fleetd` daemon. Each daemon encapsulates two roles: the *engine* and the *agent*. An engine primarily makes scheduling decisions while an agent executes units. Both the engine and agent use the _reconciliation model_, periodically generating a snapshot of "current state" and "desired state" and doing the necessary work to mutate the former towards the latter.
 
 ### Engine
 
-The most important responsibility of an Engine is that of scheduling Jobs. An Engine offers Jobs to Agents in the cluster, gathers JobBids in response to those JobOffers, and decides which Agent will actually run those Jobs. 
+- The engine is responsible for making scheduling decisions in the cluster. This happens in a reconciliation loop, triggered periodically or by certain events from etcd
+- At the start of the reconciliation process, the engine gathers a snapshot of the overall state of the cluster. This includes the set of units in the cluster (and their desired and known states) and the set of agents running in the cluster. The engine then attempts to reconcile the actual state with the desired state
+- The engine uses a _lease model_ to enforce that only one engine is running at a time. Every time a reconciliation is due, an engine will attempt to take a lease on etcd. If the lease succeeds, the reconciliation proceeds; otherwise, that engine will remain idle until the next reconciliation period begins.
+- The engine uses a simplistic "least-loaded" scheduling algorithm: when considering where to schedule a given unit, preference is given to agents running the smallest number of units.
 
-**NOTE:** The current scheduling algorithm used by an Engine is not fair. It simply accepts the first JobBid.
-
-An Engine is also responsible for reacting to cluster membership changes. The loss of a Machine triggers the rescheduling of that Machine's Jobs by a given Engine.
+The reconciliation loop of the engine can be disabled with the `disable_engine` config flag. This means that
+this `fleetd` daemon will *never* become a cluster leader. If all running daemons have this setting,
+your cluster is dead; i.e. no jobs will be scheduled. Use with care.
 
 ### Agent
 
-An Agent is responsible for executing Jobs. To do this, an Agent must first bid on a JobOffer. An Agent will not bid on any Jobs for which it does not meet the requirements.
+- The agent is responsible for actually executing Units on systems. It communicates with the local systemd instance over D-Bus.
+- Similar to the engine, the agent runs a reconciliation loop which periodically collects a snapshot from etcd to determine what it should be doing. The agent then performs the necessary actions (e.g. loading and starting units) to ensure its "current state" matches its "desired state".
+- The agent is also responsible for reporting the state of units to etcd.
 
-All outstanding JobOffers and JobBids are tracked by an Agent internally to facilitate rescheduling in response to failures. Once a JobOffer is announced as resolved (i.e. the Job is scheduled), the JobOffer and JobBid state is purged from a given Agent.
+## etcd
 
-If an Agent's JobBid is accepted, that Agent will run the Job by instructing its local instance of systemd to start the Job's Unit. The Agent then subscribes to relevant D-Bus events which, when received, are published to the cluster.
+etcd is the sole datastore in a fleet cluster. All persistent and ephemeral data is stored in etcd: unit files, cluster presence, unit state, etc.
 
-If an Agent's JobBid is rejected, that Agent simply forgets about it and moves on.
-
-### Registry
-
-The Registry is the sole datastore in a fleet cluster. All persistent and ephemeral data is stored in the registry: unit files, cluster presence, job state, etc.
-
-### Events
-
-There are four key pieces to the event system in fleet: the EventBus, EventStreams, EventListeners and Events. EventStreams generate Events, streaming them to the EventBus, which then distributes them amongst its registered EventListeners.
-
-The Event is a simple data object. It has a name, a payload, and an optional context. The name is a canonical representation of what happened, the payload is the relevant data that has changed, and the context represents in what namespace the event happened (i.e. a specific machine, job, etc).
-
-The Engine and Agent each have EventHandlers which understand how to manipulate their respective components in response to Events.
-
-There are two EventStreams in fleet. The first watches etcd for changes, while the second subscribes to D-Bus events.
+etcd is also used for all internal communication between fleet engines and agents.
 
 ## Object Model
 
 ### User-facing Objects
 
-#### Jobs and Units
+#### Units
 
-A Unit represents a single systemd unit file. Once a Unit is pushed to the cluster, it is immutable. A Unit must be destroyed and re-submitted for any modifications to be made.
+A Unit represents a single systemd unit file. Once a Unit is pushed to the cluster, its name and underlying contents are immutable; the only flag which can be changed is its desired state. A Unit must be destroyed and re-submitted for any other modifications to be made.
 
 The Unit may define a set of requirements that must be fulfilled by a given host in order for that host to run the Unit. These requirements can include resources, host metadata, locality relative to other Units, etc.
 
-A Job represents a request to run a specific Unit in the cluster. All Jobs are treated as services rather than batch processes.
-
-Stopping a Job is a destructive action - no metadata is preserved. The Job's Unit, however, is not removed from the cluster and subsequent Jobs may use it.
+All Units are treated as services rather than batch processes: if a machine on which a Unit is running goes away, fleet will reschedule the Unit elsewhere.
 
 #### State
 
-Both Jobs and Machines have dynamic state which is published both for the user and cluster to consume.
+Both Units and Machines have dynamic state which is published both for the user and cluster to consume.
 
-A UnitState object represents the state of a payload as reported by systemd on a given Machine. Only the Machine running an actual Job will publish a corresponding UnitState object.
+A UnitState object represents the state of a Unit in the fleet engine. A UnitState object represents the state of a payload as reported by systemd on a given Machine. For more information on states, see the [states documentation].
 
-A MachineState object represents the state of a host in the cluster at the time the object was generated. MachineState objects are published on an interval with a TTL, keeping the external view of a cluster relatively accurate at any given time.
 
-### Internal Objects
+# Security
 
-#### Offers and Bids
+## Preview Release
 
-A JobOffer is created by an Engine to represent the need to schedule a given Job. The Engine is essentially broadcasting, "Who can run this Job?"
+Current releases of fleet don't currently perform any authentication or authorization for submitted units. This means that any client that can access your etcd cluster can potentially run arbitrary code on many of your machines very easily, thus it is strongly recommended to enable [TLS authentication][etcd-security] on the etcd side, set proper file permissions to the keypair on the host and [configure fleet][fleet-tls] to use keypair.
 
-A JobBid represents a single Agent's request to run a Job. A JobBid will only be created by Agents that have compared their current capabilities to the requirements of a given Job.
+## Securing etcd
 
-Once an Engine receives enough bids in response to a given offer, it makes a scheduling decision and destroys that offer.
+You should avoid public access to etcd and instead run fleet [from your local laptop][using-the-client] with the `--tunnel` flag to run commands over an SSH tunnel. You can alias this flag for easier usage: `alias fleetctl=fleetctl --tunnel 10.10.10.10` - or use the environment variable `FLEETCTL_TUNNEL`.
 
-#### Machine
+## Securing fleetd
 
-The Machine object acts as a factory for MachineState objects. It is shared between several internal components of fleet to ensure the view of the host is consistent at any given point in time.
+systemd version 216 or later supports [`polkit(8)`][polkit] rules to control access for unprivileged users. It is recommended to run fleetd under its own `fleet` user and group, and to set the permissions of the fleetd API socket to mode `0660`, allowing only that user and group to write to the socket. This configuration will require a login user to be in the `fleet` group to perform actions with fleetd. The polkit rule below grants the the fleetd process running as the unprivileged `fleet` user to communicate with systemd over [D-Bus][d-bus]:
 
-## Putting it All Together
+```js
+polkit.addRule(function(action, subject) {
+  if (action.id.indexOf("org.freedesktop.systemd1.") == 0 &&
+      subject.user == "fleet") {
+        return polkit.Result.YES;
+  }
+});
+```
 
-The following demonstrates how the above objects and components interact with one another:
-
-![image](img/Schedule-Diagram.png)
+[etcd-security]: https://github.com/coreos/etcd/blob/master/Documentation/v2/security.md
+[d-bus]: https://www.freedesktop.org/wiki/Software/dbus/
+[fleet-tls]: deployment-and-configuration.md#tls-authentication
+[polkit]: https://www.freedesktop.org/software/polkit/docs/latest/polkit.8.html
+[states documentation]: states.md
+[using-the-client]: using-the-client.md#get-up-and-running

@@ -1,153 +1,250 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package job
 
 import (
-	"strconv"
+	"fmt"
 	"strings"
 
-	log "github.com/coreos/fleet/third_party/github.com/golang/glog"
-
-	"github.com/coreos/fleet/resource"
+	"github.com/coreos/fleet/pkg"
 	"github.com/coreos/fleet/unit"
 )
 
 type JobState string
+type JobAction string
 
 const (
 	JobStateInactive = JobState("inactive")
 	JobStateLoaded   = JobState("loaded")
 	JobStateLaunched = JobState("launched")
+
+	JobActionSchedule   = JobAction("job_action_schedule")
+	JobActionUnschedule = JobAction("job_action_unschedule")
+	JobActionReschedule = JobAction("job_action_reschedule")
 )
 
 // fleet-specific unit file requirement keys.
-// "X-" prefix only appears in unit file and is dropped in code before the value is used.
+// For certain values, the (optional, deprecated) "X-" or "X-Condition"
+// prefixes appear in unit files but are dropped in code before the value is used.
 const (
 	// Require the unit be scheduled to a specific machine identified by given ID.
-	fleetXConditionMachineID = "ConditionMachineID"
-	// Legacy form of FleetXConditionMachineID.
-	fleetXConditionMachineBootID = "ConditionMachineBootID"
+	fleetMachineID = "MachineID"
+	// Legacy form of fleetMachineID.
+	fleetMachineBootID = "MachineBootID"
 	// Limit eligible machines to the one that hosts a specific unit.
-	fleetXConditionMachineOf = "ConditionMachineOf"
+	fleetMachineOf = "MachineOf"
 	// Prevent a unit from being collocated with other units using glob-matching on the other unit names.
-	fleetXConflicts = "Conflicts"
-	// Machine metadata key in the unit file, without the X- prefix
-	fleetXConditionMachineMetadata = "ConditionMachineMetadata"
-	// Memory required in MB
-	fleetXMemoryReservation = "MemoryReservation"
-	// Cores required in hundreds, ie 100=1core, 50=0.5core, 200=2cores
-	fleetXCoresReservation = "CoresReservation"
-	// Disk required in MB
-	fleetXDiskReservation = "DiskReservation"
-	// Machine metadata key for the deprecated `require` flag
-	fleetFlagMachineMetadata = "MachineMetadata"
+	fleetConflicts = "Conflicts"
+	// Reschedule a unit to another machine
+	fleetReplaces = "Replaces"
+	// Machine metadata key in the unit file
+	fleetMachineMetadata = "MachineMetadata"
+	// Require that the unit be scheduled on every machine in the cluster
+	fleetGlobal = "Global"
+
+	deprecatedXPrefix          = "X-"
+	deprecatedXConditionPrefix = "X-Condition"
 )
 
-func ParseJobState(s string) *JobState {
+// validRequirements encapsulates all current and deprecated unit file requirement keys
+var validRequirements = pkg.NewUnsafeSet(
+	fleetMachineID,
+	deprecatedXConditionPrefix+fleetMachineID,
+	deprecatedXConditionPrefix+fleetMachineBootID,
+	deprecatedXConditionPrefix+fleetMachineOf,
+	fleetMachineOf,
+	deprecatedXPrefix+fleetConflicts,
+	fleetConflicts,
+	deprecatedXConditionPrefix+fleetMachineMetadata,
+	fleetMachineMetadata,
+	fleetGlobal,
+	fleetReplaces,
+)
+
+func ParseJobState(s string) (JobState, error) {
 	js := JobState(s)
+
+	var err error
 	if js != JobStateInactive && js != JobStateLoaded && js != JobStateLaunched {
-		return nil
+		err = fmt.Errorf("invalid value %q for JobState", s)
+		js = JobStateInactive
 	}
-	return &js
+
+	return js, err
 }
 
+// Job is a legacy construct encapsulating a scheduled unit in fleet
 type Job struct {
-	Name      string
-	State     *JobState
-	Unit      unit.Unit
-	UnitHash  unit.Hash
-	UnitState *unit.UnitState
+	Name            string
+	State           *JobState
+	TargetState     JobState
+	TargetMachineID string
+	Unit            unit.UnitFile
+}
+
+// ScheduledUnit represents a Unit known by fleet and encapsulates its current scheduling state. This does not include Global units.
+type ScheduledUnit struct {
+	Name            string
+	State           *JobState
+	TargetMachineID string
+}
+
+// Unit represents a Unit that has been submitted to fleet
+// (list-unit-files)
+type Unit struct {
+	Name        string
+	Unit        unit.UnitFile
+	TargetState JobState
+}
+
+// IsGlobal returns whether a Unit is considered a global unit
+func (u *Unit) IsGlobal() bool {
+	j := &Job{
+		Name: u.Name,
+		Unit: u.Unit,
+	}
+	values := j.requirements()[fleetGlobal]
+	if len(values) == 0 {
+		return false
+	}
+	// Last value found wins
+	last := values[len(values)-1]
+	return isTruthyValue(last)
 }
 
 // NewJob creates a new Job based on the given name and Unit.
-// The returned Job has a populated UnitHash and empty JobState and
-// UnitState. nil is returned on failure.
-func NewJob(name string, unit unit.Unit) *Job {
+// The returned Job has a populated UnitHash and empty JobState.
+// nil is returned on failure.
+func NewJob(name string, unit unit.UnitFile) *Job {
 	return &Job{
-		Name:      name,
-		State:     nil,
-		Unit:      unit,
-		UnitHash:  unit.Hash(),
-		UnitState: nil,
+		Name:            name,
+		State:           nil,
+		TargetState:     JobStateInactive,
+		TargetMachineID: "",
+		Unit:            unit,
 	}
 }
 
-// IsBatch identifies whether the Job is intended to execute once, and, on
-// completion, not be migrated around the cluster. This is determined by
-// whether the unit file associated with the Job is a Service of type "oneshot".
-func (j *Job) IsBatch() bool {
-	s, ok := j.Unit.Contents["Service"]
-	if !ok {
-		return false
+// The following helper functions are to facilitate the transition from Job --> Unit
+func (u *Unit) Conflicts() []string {
+	j := &Job{
+		Name: u.Name,
+		Unit: u.Unit,
 	}
-	t, ok := s["Type"]
-	if !ok || len(t) == 0 {
-		return false
-	}
-	// If multiple Types are defined, systemd uses the last
-	return t[len(t)-1] == "oneshot"
+	return j.Conflicts()
 }
 
-// Requirements returns all relevant options from the [X-Fleet] section of a unit file.
+func (u *Unit) Replaces() []string {
+	j := &Job{
+		Name: u.Name,
+		Unit: u.Unit,
+	}
+	return j.Replaces()
+}
+
+func (u *Unit) Peers() []string {
+	j := &Job{
+		Name: u.Name,
+		Unit: u.Unit,
+	}
+	return j.Peers()
+}
+
+func (u *Unit) RequiredTarget() (string, bool) {
+	j := &Job{
+		Name: u.Name,
+		Unit: u.Unit,
+	}
+	return j.RequiredTarget()
+}
+
+func (u *Unit) RequiredTargetMetadata() map[string]pkg.Set {
+	j := &Job{
+		Name: u.Name,
+		Unit: u.Unit,
+	}
+	return j.RequiredTargetMetadata()
+}
+
+// requirements returns all relevant options from the [X-Fleet] section of a unit file.
 // Relevant options are identified with a `X-` prefix in the unit.
 // This prefix is stripped from relevant options before being returned.
-func (j *Job) Requirements() map[string][]string {
+// Furthermore, specifier substitution (using unitPrintf) is performed on all requirements.
+func (j *Job) requirements() map[string][]string {
+	uni := unit.NewUnitNameInfo(j.Name)
 	requirements := make(map[string][]string)
-	for key, value := range j.Unit.Contents["X-Fleet"] {
-		if !strings.HasPrefix(key, "X-") {
-			continue
-		}
-
-		// Strip off leading X-
-		key = key[2:]
-
+	for key, values := range j.Unit.Contents["X-Fleet"] {
 		if _, ok := requirements[key]; !ok {
 			requirements[key] = make([]string, 0)
 		}
 
-		requirements[key] = value
+		if uni != nil {
+			processedValues := make([]string, len(values))
+			for i, v := range values {
+				processedValues[i] = unitPrintf(v, *uni)
+			}
+			requirements[key] = processedValues
+		} else {
+			requirements[key] = values
+		}
 	}
 
 	return requirements
 }
 
+// ValidateRequirements ensures that all options in the [X-Fleet] section of
+// the job's associated unit file are known keys. If not, an error is
+// returned.
+func (j *Job) ValidateRequirements() error {
+	for key, _ := range j.requirements() {
+		if !validRequirements.Contains(key) {
+			return fmt.Errorf("unrecognized requirement in [X-Fleet] section: %q", key)
+		}
+	}
+	return nil
+}
+
 // Conflicts returns a list of Job names that cannot be scheduled to the same
 // machine as this Job.
 func (j *Job) Conflicts() []string {
-	conflicts, ok := j.Requirements()[fleetXConflicts]
-	if ok {
-		return conflicts
-	}
-	return make([]string, 0)
+	conflicts := make([]string, 0)
+
+	ldConflicts := splitCombine(j.requirements()[deprecatedXPrefix+fleetConflicts])
+	conflicts = append(conflicts, ldConflicts...)
+
+	dConflicts := splitCombine(j.requirements()[fleetConflicts])
+	conflicts = append(conflicts, dConflicts...)
+
+	return conflicts
+}
+
+// Replaces returns a list of Job names that should be scheduled to the another
+// machine as this Job.
+func (j *Job) Replaces() []string {
+	replaces := make([]string, 0)
+	replaces = append(replaces, j.requirements()[fleetReplaces]...)
+	return replaces
 }
 
 // Peers returns a list of Job names that must be scheduled to the same
 // machine as this Job.
 func (j *Job) Peers() []string {
-	peers, ok := j.Requirements()[fleetXConditionMachineOf]
-	if !ok {
-		return []string{}
-	}
+	peers := make([]string, 0)
+	peers = append(peers, j.requirements()[deprecatedXConditionPrefix+fleetMachineOf]...)
+	peers = append(peers, j.requirements()[fleetMachineOf]...)
 	return peers
-}
-
-func (j *Job) resourceFromKey(resKey string) int {
-	valStr, ok := j.Requirements()[resKey]
-	if ok && len(valStr) > 0 {
-		val, err := strconv.Atoi(valStr[0])
-		if err != nil {
-			log.Errorf("failed to parse resource requirement %s from %s: %v", resKey, j.Name, err)
-			return 0
-		}
-		return val
-	}
-	return 0
-}
-
-func (j *Job) Resources() resource.ResourceTuple {
-	return resource.ResourceTuple{
-		Cores:  j.resourceFromKey(fleetXCoresReservation),
-		Memory: j.resourceFromKey(fleetXMemoryReservation),
-		Disk:   j.resourceFromKey(fleetXDiskReservation),
-	}
 }
 
 // RequiredTarget determines whether or not this Job must be scheduled to
@@ -156,18 +253,27 @@ func (j *Job) Resources() resource.ResourceTuple {
 // true. If no requirement exists, an empty string along with a bool false
 // will be returned.
 func (j *Job) RequiredTarget() (string, bool) {
-	requirements := j.Requirements()
+	requirements := j.requirements()
 
-	machIDs, ok := requirements[fleetXConditionMachineID]
+	var machIDs []string
+	var ok bool
+	// Best case: look for modern declaration
+	machIDs, ok = requirements[fleetMachineID]
 	if ok && len(machIDs) != 0 {
 		return machIDs[0], true
 	}
 
-	// Fall back to the legacy option if it exists. This is unlikely
-	// to actually work as the user intends, but it's better to
-	// prevent a job from starting that has a legacy requirement
-	// than to ignore the requirement and let it start.
-	bootIDs, ok := requirements[fleetXConditionMachineBootID]
+	// First fall back to the deprecated syntax
+	machIDs, ok = requirements[deprecatedXConditionPrefix+fleetMachineID]
+	if ok && len(machIDs) != 0 {
+		return machIDs[0], true
+	}
+
+	// Finally, fall back to the legacy option if it exists. This is
+	// unlikely to actually work as the user intends, but it's better to
+	// prevent a job from starting that has a legacy requirement than to
+	// ignore the requirement and let it start.
+	bootIDs, ok := requirements[deprecatedXConditionPrefix+fleetMachineBootID]
 	if ok && len(bootIDs) != 0 {
 		return bootIDs[0], true
 	}
@@ -175,38 +281,70 @@ func (j *Job) RequiredTarget() (string, bool) {
 	return "", false
 }
 
-// RequiredTargetMetadata return all machine-related metadata from a Job's requirements
-func (j *Job) RequiredTargetMetadata() map[string][]string {
-	metadata := make(map[string][]string)
-	for key, values := range j.Requirements() {
-		// Deprecated syntax added to the metadata via the old `--require` flag.
-		if strings.HasPrefix(key, fleetFlagMachineMetadata) {
-			if len(values) == 0 {
+// RequiredTargetMetadata return all machine-related metadata from a Job's
+// requirements. Valid metadata fields are strings of the form `key=value`,
+// where both key and value are not the empty string.
+func (j *Job) RequiredTargetMetadata() map[string]pkg.Set {
+	metadata := make(map[string]pkg.Set)
+
+	for _, key := range []string{
+		deprecatedXConditionPrefix + fleetMachineMetadata,
+		fleetMachineMetadata,
+	} {
+		for _, valuePair := range j.requirements()[key] {
+			s := strings.Split(valuePair, "=")
+
+			if len(s) != 2 {
 				continue
 			}
 
-			metadata[key[15:]] = values
-		} else if key == fleetXConditionMachineMetadata {
-			for _, valuePair := range values {
-				s := strings.Split(valuePair, "=")
-
-				if len(s) != 2 {
-					continue
-				}
-
-				if len(s[0]) == 0 || len(s[1]) == 0 {
-					continue
-				}
-
-				var mValues []string
-				if mv, ok := metadata[s[0]]; ok {
-					mValues = mv
-				}
-
-				metadata[s[0]] = append(mValues, s[1])
+			if len(s[0]) == 0 || len(s[1]) == 0 {
+				continue
 			}
+
+			if _, ok := metadata[s[0]]; !ok {
+				metadata[s[0]] = pkg.NewUnsafeSet()
+			}
+			metadata[s[0]].Add(s[1])
 		}
 	}
 
 	return metadata
+}
+
+func (j *Job) Scheduled() bool {
+	return len(j.TargetMachineID) > 0
+}
+
+// unitPrintf is analogous to systemd's `unit_name_printf`. It will take the
+// given string and replace the following specifiers with the values from the
+// provided UnitNameInfo:
+// 	%n: the full name of the unit               (foo@bar.waldo)
+// 	%N: the name of the unit without the suffix (foo@bar)
+// 	%p: the prefix                              (foo)
+// 	%i: the instance                            (bar)
+func unitPrintf(s string, nu unit.UnitNameInfo) (out string) {
+	out = strings.Replace(s, "%n", nu.FullName, -1)
+	out = strings.Replace(out, "%N", nu.Name, -1)
+	out = strings.Replace(out, "%p", nu.Prefix, -1)
+	out = strings.Replace(out, "%i", nu.Instance, -1)
+	return
+}
+
+// isTruthyValue returns true if a given string is any of "truthy" value,
+// i.e. "true", "yes", "1", "on", or "t".
+func isTruthyValue(s string) bool {
+	chl := strings.ToLower(s)
+	return chl == "true" || chl == "yes" || chl == "1" || chl == "on" || chl == "t"
+}
+
+// splitCombine retrieves each word from an input string slice, to put each
+// one again into a single slice.
+func splitCombine(inStrs []string) []string {
+	outStrs := make([]string, 0)
+	for _, str := range inStrs {
+		inStrs := strings.Fields(str)
+		outStrs = append(outStrs, inStrs...)
+	}
+	return outStrs
 }

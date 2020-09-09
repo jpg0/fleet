@@ -1,56 +1,66 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package registry
 
 import (
-	"path"
 	"time"
 
+	etcd "github.com/coreos/etcd/client"
+	"golang.org/x/net/context"
+
 	"github.com/coreos/fleet/job"
+	"github.com/coreos/fleet/unit"
 )
 
-func (r *EtcdRegistry) determineJobState(jobName string) *job.JobState {
-	state := job.JobStateInactive
+// determineJobState decides what the State field of a Job object should
+// be, based on three parameters:
+//  - heartbeat should be the machine ID that is known to have recently
+//    heartbeaten (see UnitHeartbeat) the Unit.
+//  - tgt should be the machine ID to which the Job is currently scheduled
+//  - us should be the most recent UnitState
+func determineJobState(heartbeat, tgt string, us *unit.UnitState) (state job.JobState) {
+	state = job.JobStateInactive
 
-	tgt, _ := r.GetJobTarget(jobName)
-	if tgt == "" {
-		return &state
-	}
-
-	if r.getUnitState(jobName) == nil {
-		return &state
+	if tgt == "" || us == nil {
+		return
 	}
 
 	state = job.JobStateLoaded
 
-	agent, pulse := r.CheckJobPulse(jobName)
-	if !pulse || agent != tgt {
-		return &state
+	if heartbeat != tgt {
+		return
 	}
 
 	state = job.JobStateLaunched
-	return &state
+	return
 }
 
-func (r *EtcdRegistry) JobHeartbeat(jobName, agentMachID string, ttl time.Duration) error {
-	key := r.jobHeartbeatPath(jobName)
-	_, err := r.etcd.Set(key, agentMachID, uint64(ttl.Seconds()))
+func (r *EtcdRegistry) UnitHeartbeat(name, machID string, ttl time.Duration) error {
+	key := r.jobHeartbeatPath(name)
+	opts := &etcd.SetOptions{
+		TTL: ttl,
+	}
+	_, err := r.kAPI.Set(context.Background(), key, machID, opts)
 	return err
 }
 
-func (r *EtcdRegistry) CheckJobPulse(jobName string) (string, bool) {
-	key := r.jobHeartbeatPath(jobName)
-	resp, err := r.etcd.Get(key, false, false)
-	if err != nil {
-		return "", false
-	}
-
-	return resp.Node.Value, true
-}
-
-func (r *EtcdRegistry) ClearJobHeartbeat(jobName string) {
-	key := r.jobHeartbeatPath(jobName)
-	r.etcd.Delete(key, false)
+func (r *EtcdRegistry) ClearUnitHeartbeat(name string) {
+	key := r.jobHeartbeatPath(name)
+	r.kAPI.Delete(context.Background(), key, nil)
 }
 
 func (r *EtcdRegistry) jobHeartbeatPath(jobName string) string {
-	return path.Join(r.keyPrefix, jobPrefix, jobName, "job-state")
+	return r.prefixed(jobPrefix, jobName, "job-state")
 }

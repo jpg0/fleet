@@ -1,3 +1,17 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package functional
 
 import (
@@ -7,6 +21,7 @@ import (
 	"os"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/coreos/fleet/job"
 	"github.com/coreos/fleet/systemd"
@@ -20,7 +35,7 @@ func TestSystemdUnitFlow(t *testing.T) {
 	}
 	defer os.RemoveAll(uDir)
 
-	mgr, err := systemd.NewSystemdUnitManager(uDir)
+	mgr, err := systemd.NewSystemdUnitManager(uDir, false)
 	if err != nil {
 		t.Fatalf("Failed initializing SystemdUnitManager: %v", err)
 	}
@@ -34,10 +49,15 @@ func TestSystemdUnitFlow(t *testing.T) {
 		t.Fatalf("Expected no units to be returned, got %v", units)
 	}
 
-	name := fmt.Sprintf("fleet-unit-%d.service", rand.Int63())
-	uf := unit.NewUnit(`[Service]
+	contents := `[Service]
 ExecStart=/usr/bin/sleep 3000
-`)
+`
+	name := fmt.Sprintf("fleet-unit-%d.service", rand.Int63())
+	uf, err := unit.NewUnitFile(contents)
+	if err != nil {
+		t.Fatalf("Invalid unit file: %v", err)
+	}
+	hash := uf.Hash().String()
 	j := job.NewJob(name, *uf)
 
 	if err := mgr.Load(j.Name, j.Unit); err != nil {
@@ -53,38 +73,24 @@ ExecStart=/usr/bin/sleep 3000
 		t.Fatalf("Expected [hello.service], got %v", units)
 	}
 
-	us, err := mgr.GetUnitState(name)
-	if err == nil {
-		expect := unit.UnitState{"loaded", "inactive", "dead", nil}
-		if !reflect.DeepEqual(expect, *us) {
-			t.Errorf("Expected UnitState %v, got %v", expect, *us)
-		}
-	} else {
-		t.Errorf("Failed determining unit state: %v", err)
+	err = waitForUnitState(mgr, name, unit.UnitState{"loaded", "inactive", "dead", "", hash, ""})
+	if err != nil {
+		t.Error(err)
 	}
 
-	mgr.Start(name)
-
-	us, err = mgr.GetUnitState(name)
-	if err == nil {
-		expect := unit.UnitState{"loaded", "active", "running", nil}
-		if !reflect.DeepEqual(expect, *us) {
-			t.Errorf("Expected UnitState %v, got %v", expect, *us)
-		}
-	} else {
-		t.Errorf("Failed determining unit state: %v", err)
+	err = mgr.TriggerStart(name)
+	if err != nil {
+		t.Error(err)
 	}
 
-	mgr.Stop(name)
+	err = waitForUnitState(mgr, name, unit.UnitState{"loaded", "active", "running", "", hash, ""})
+	if err != nil {
+		t.Error(err)
+	}
 
-	us, err = mgr.GetUnitState(name)
-	if err == nil {
-		expect := unit.UnitState{"loaded", "inactive", "dead", nil}
-		if !reflect.DeepEqual(expect, *us) {
-			t.Errorf("Expected UnitState %v, got %v", expect, *us)
-		}
-	} else {
-		t.Errorf("Failed determining unit state: %v", err)
+	err = mgr.TriggerStop(name)
+	if err != nil {
+		t.Error(err)
 	}
 
 	mgr.Unload(name)
@@ -96,5 +102,25 @@ ExecStart=/usr/bin/sleep 3000
 
 	if len(units) > 0 {
 		t.Fatalf("Expected no units to be returned, got %v", units)
+	}
+}
+
+func waitForUnitState(mgr unit.UnitManager, name string, want unit.UnitState) error {
+	timeout := time.After(time.Second)
+	for {
+		select {
+		case <-timeout:
+			return fmt.Errorf("Timed out waiting for state of %s to match %#v", name, want)
+		default:
+		}
+
+		got, err := mgr.GetUnitState(name)
+		if err != nil {
+			return err
+		}
+
+		if reflect.DeepEqual(want, *got) {
+			return nil
+		}
 	}
 }

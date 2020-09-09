@@ -1,3 +1,17 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package ssh
 
 import (
@@ -12,9 +26,9 @@ import (
 	"strconv"
 	"strings"
 
-	gossh "github.com/coreos/fleet/third_party/code.google.com/p/gosshnew/ssh"
-	log "github.com/coreos/fleet/third_party/github.com/golang/glog"
+	gossh "golang.org/x/crypto/ssh"
 
+	"github.com/coreos/fleet/log"
 	"github.com/coreos/fleet/pkg"
 )
 
@@ -71,6 +85,48 @@ type HostKeyChecker struct {
 // NewHostKeyChecker returns a new HostKeyChecker
 func NewHostKeyChecker(m HostKeyManager) *HostKeyChecker {
 	return &HostKeyChecker{m, askToTrustHost}
+}
+
+// Returns public key algorithms of the remote host that are listed
+// inside known_hosts
+func (kc *HostKeyChecker) GetHostKeyAlgorithms(addr string) []string {
+	var results []string
+	remoteAddr, err := kc.addrToHostPort(addr)
+	if err != nil {
+		log.Errorf("Failed to parse address %v: %v", addr, err)
+		return nil
+	}
+
+	hostKeys, err := kc.m.GetHostKeys()
+
+	_, ok := err.(*os.PathError)
+	if err != nil && !ok {
+		log.Errorf("Failed to read known_hosts file %v: %v", kc.m.String(), err)
+		return nil
+	}
+
+	for pattern, keys := range hostKeys {
+		if !matchHost(remoteAddr, pattern) {
+			remoteIP, err := net.ResolveTCPAddr("tcp", addr)
+			if err != nil {
+				log.Errorf("Failed to resolve TCP address %v: %v", addr, err)
+				continue
+			}
+			ipAddr, err := kc.addrToHostPort(remoteIP.String())
+			if err != nil {
+				log.Errorf("Failed to parse address %v: %v", remoteIP.String(), err)
+				continue
+			}
+			if !matchHost(ipAddr, pattern) {
+				continue
+			}
+		}
+		for _, hostKey := range keys {
+			results = append(results, hostKey.Type())
+		}
+	}
+
+	return results
 }
 
 // Check is called during the handshake to check the server's public key for
@@ -142,13 +198,13 @@ func (kc *HostKeyChecker) addrToHostPort(a string) (string, error) {
 	}
 	host, p, err := net.SplitHostPort(a)
 	if err != nil {
-		log.V(1).Infof("Unable to parse addr %s: %v", a, err)
+		log.Debugf("Unable to parse addr %s: %v", a, err)
 		return "", err
 	}
 
 	port, err := strconv.Atoi(p)
 	if err != nil {
-		log.V(1).Infof("Error parsing port %s: %v", p, err)
+		log.Debugf("Error parsing port %s: %v", p, err)
 		return "", err
 	}
 

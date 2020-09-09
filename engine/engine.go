@@ -1,120 +1,291 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package engine
 
 import (
-	"errors"
+	"fmt"
+	"time"
 
-	log "github.com/coreos/fleet/third_party/github.com/golang/glog"
-
-	"github.com/coreos/fleet/job"
+	"github.com/coreos/fleet/log"
 	"github.com/coreos/fleet/machine"
+	"github.com/coreos/fleet/metrics"
+	"github.com/coreos/fleet/pkg"
+	"github.com/coreos/fleet/pkg/lease"
 	"github.com/coreos/fleet/registry"
 )
 
+const (
+	// name of lease that must be held by the lead engine in a cluster
+	engineLeaseName = "engine-leader"
+
+	// version at which the current engine code operates
+	engineVersion = 1
+)
+
 type Engine struct {
-	registry registry.Registry
-	machine  machine.Machine
-	// keeps a picture of the load in the cluster for more intelligent scheduling
-	clust *cluster
+	rec       *Reconciler
+	registry  registry.Registry
+	cRegistry registry.ClusterRegistry
+	lManager  lease.Manager
+	rStream   pkg.EventStream
+	machine   machine.Machine
+
+	lease lease.Lease
+
+	updateEngineState func(newEngine machine.MachineState)
 }
 
-func New(reg registry.Registry, mach machine.Machine) *Engine {
-	return &Engine{reg, mach, newCluster()}
+type CompleteRegistry interface {
+	registry.Registry
+	registry.ClusterRegistry
 }
 
-// CheckForWork attempts to rectify the current state of all Jobs in the cluster
-// with their target states wherever discrepancies are identified.
-func (e *Engine) CheckForWork() {
-	log.Infof("Polling etcd for actionable Jobs")
+func New(reg CompleteRegistry, lManager lease.Manager, rStream pkg.EventStream, mach machine.Machine, updateEngineState func(newEngine machine.MachineState)) *Engine {
+	rec := NewReconciler()
+	return &Engine{
+		rec:               rec,
+		registry:          reg,
+		cRegistry:         reg,
+		lManager:          lManager,
+		rStream:           rStream,
+		machine:           mach,
+		updateEngineState: updateEngineState,
+	}
+}
 
-	for _, jo := range e.registry.UnresolvedJobOffers() {
-		bids, err := e.registry.Bids(&jo)
-		if err != nil {
-			log.Errorf("Failed determining open JobBids for JobOffer(%s): %v", jo.Job.Name, err)
-			continue
-		}
-		if len(bids) == 0 {
-			log.V(1).Infof("No bids found for open JobOffer(%s), ignoring", jo.Job.Name)
-			continue
+func (e *Engine) Run(ival time.Duration, stop <-chan struct{}) {
+	leaseTTL := ival * 5
+	if e.machine.State().Capabilities.Has(machine.CapGRPC) {
+		// With grpc it doesn't make sense to set to 5secs the TTL of the etcd key.
+		// This has a special impact whenever we have high worload in the cluster, cause
+		// it'd provoke constant leader re-elections.
+		// TODO: IMHO, this should be configurable via a flag to disable the TTL.
+		leaseTTL = ival * 500000
+	}
+	machID := e.machine.State().ID
+
+	reconcile := func() {
+		if !ensureEngineVersionMatch(e.cRegistry, engineVersion) {
+			return
 		}
 
-		log.Infof("Resolving JobOffer(%s), scheduling to Machine(%s)", bids[0].JobName, bids[0].MachineID)
-		if e.ResolveJobOffer(bids[0].JobName, bids[0].MachineID); err != nil {
-			log.Infof("Failed scheduling Job(%s) to Machine(%s)", bids[0].JobName, bids[0].MachineID)
+		if e.machine.State().Capabilities.Has(machine.CapGRPC) {
+			// rpcLeadership gets the lease (leader), and apply changes to the engine state if need it.
+			e.lease = e.rpcLeadership(leaseTTL, machID)
 		} else {
-			log.Infof("Scheduled Job(%s) to Machine(%s)", bids[0].JobName, bids[0].MachineID)
+			var l lease.Lease
+			if isLeader(e.lease, machID) {
+				l = renewLeadership(e.lease, leaseTTL)
+			} else {
+				l = acquireLeadership(e.lManager, machID, engineVersion, leaseTTL)
+			}
+
+			// log all leadership changes
+			if l != nil && e.lease == nil && l.MachineID() != machID {
+				log.Infof("Engine leader is %s", l.MachineID())
+			} else if l != nil && e.lease != nil && l.MachineID() != e.lease.MachineID() {
+				log.Infof("Engine leadership changed from %s to %s", e.lease.MachineID(), l.MachineID())
+			}
+
+			e.lease = l
+		}
+
+		if !isLeader(e.lease, machID) {
+			return
+		}
+
+		// abort is closed when reconciliation must stop prematurely, either
+		// by a local timeout or the fleet server shutting down
+		abort := make(chan struct{})
+
+		// monitor is used to shut down the following goroutine
+		monitor := make(chan struct{})
+
+		go func() {
+			select {
+			case <-monitor:
+				return
+			case <-time.After(leaseTTL):
+				close(abort)
+			case <-stop:
+				close(abort)
+			}
+		}()
+
+		start := time.Now()
+		e.rec.Reconcile(e, abort)
+		close(monitor)
+		elapsed := time.Now().Sub(start)
+		metrics.ReportEngineReconcileSuccess(start)
+
+		msg := fmt.Sprintf("Engine completed reconciliation in %s", elapsed)
+		if elapsed > ival {
+			log.Warning(msg)
+		} else {
+			log.Debug(msg)
 		}
 	}
 
-	jobs, _ := e.registry.GetAllJobs()
-	for _, j := range jobs {
-		ts, _ := e.registry.GetJobTargetState(j.Name)
-		if ts == nil || j.State == nil || *ts == *j.State {
-			continue
-		}
+	rec := pkg.NewPeriodicReconciler(ival, reconcile, e.rStream)
+	rec.Run(stop)
+}
 
-		if *j.State == job.JobStateInactive {
-			log.Infof("Offering Job(%s)", j.Name)
-			e.OfferJob(j)
-		} else if *ts == job.JobStateInactive {
-			log.Infof("Unscheduling Job(%s)", j.Name)
-			target, _ := e.registry.GetJobTarget(j.Name)
-			e.registry.ClearJobTarget(j.Name, target)
-		}
+func (e *Engine) Purge() {
+	// only purge the lease if we are the leader
+	if !isLeader(e.lease, e.machine.State().ID) {
+		return
+	}
+	err := e.lease.Release()
+	if err != nil {
+		log.Errorf("Failed to release lease: %v", err)
 	}
 }
 
-func (e *Engine) OfferJob(j job.Job) error {
-	log.V(1).Infof("Attempting to lock Job(%s)", j.Name)
-
-	mutex := e.registry.LockJob(j.Name, e.machine.State().ID)
-	if mutex == nil {
-		log.V(1).Infof("Could not lock Job(%s)", j.Name)
-		return errors.New("could not lock Job")
+func isLeader(l lease.Lease, machID string) bool {
+	if l == nil {
+		return false
 	}
-	defer mutex.Unlock()
-
-	log.V(1).Infof("Claimed Job(%s)", j.Name)
-
-	machineIDs, err := e.partitionCluster(&j)
-	if err != nil {
-		log.Errorf("failed partitioning cluster for Job(%s): %v", j.Name, err)
-		return err
+	if l.MachineID() != machID {
+		return false
 	}
-
-	offer := job.NewOfferFromJob(j, machineIDs)
-
-	err = e.registry.CreateJobOffer(offer)
-	if err == nil {
-		log.Infof("Published JobOffer(%s)", offer.Job.Name)
-	}
-
-	return err
+	return true
 }
 
-func (e *Engine) ResolveJobOffer(jobName string, machID string) error {
-	log.V(1).Infof("Attempting to lock JobOffer(%s)", jobName)
-	mutex := e.registry.LockJobOffer(jobName, e.machine.State().ID)
-
-	if mutex == nil {
-		log.V(1).Infof("Could not lock JobOffer(%s)", jobName)
-		return errors.New("could not lock JobOffer")
-	}
-	defer mutex.Unlock()
-
-	log.V(1).Infof("Claimed JobOffer(%s)", jobName)
-
-	err := e.registry.ResolveJobOffer(jobName)
+func ensureEngineVersionMatch(cReg registry.ClusterRegistry, expect int) bool {
+	v, err := cReg.EngineVersion()
 	if err != nil {
-		log.Errorf("Failed resolving JobOffer(%s): %v", jobName, err)
-		return err
+		log.Errorf("Unable to determine cluster engine version")
+		return false
 	}
 
-	err = e.registry.ScheduleJob(jobName, machID)
+	if v < expect {
+		err = cReg.UpdateEngineVersion(v, expect)
+		if err != nil {
+			log.Errorf("Failed updating cluster engine version from %d to %d: %v", v, expect, err)
+			return false
+		}
+		log.Infof("Updated cluster engine version from %d to %d", v, expect)
+	} else if v > expect {
+		log.Debugf("Cluster engine version higher than local engine version (%d > %d), unable to participate", v, expect)
+		return false
+	}
+
+	return true
+}
+
+func acquireLeadership(lManager lease.Manager, machID string, ver int, ttl time.Duration) lease.Lease {
+	existing, err := lManager.GetLease(engineLeaseName)
 	if err != nil {
-		log.Errorf("Failed scheduling Job(%s): %v", jobName, err)
-		return err
+		log.Errorf("Unable to determine current lease: %v", err)
+		return nil
 	}
 
-	log.Infof("Scheduled Job(%s) to Machine(%s)", jobName, machID)
-	return nil
+	var l lease.Lease
+	if existing == nil {
+		l, err = lManager.AcquireLease(engineLeaseName, machID, ver, ttl)
+		if err != nil {
+			log.Errorf("Engine leadership acquisition failed: %v", err)
+			return nil
+		} else if l == nil {
+			log.Debugf("Unable to acquire engine leadership")
+			return nil
+		}
+		log.Infof("Engine leadership acquired")
+		metrics.ReportEngineLeader()
+		return l
+	}
+
+	if existing.Version() >= ver {
+		log.Debugf("Lease already held by Machine(%s) operating at acceptable version %d", existing.MachineID(), existing.Version())
+		return existing
+	}
+
+	rem := existing.TimeRemaining()
+	l, err = lManager.StealLease(engineLeaseName, machID, ver, ttl+rem, existing.Index())
+	if err != nil {
+		log.Errorf("Engine leadership steal failed: %v", err)
+		return nil
+	} else if l == nil {
+		log.Debugf("Unable to steal engine leadership")
+		return nil
+	}
+
+	log.Infof("Stole engine leadership from Machine(%s)", existing.MachineID())
+	metrics.ReportEngineLeader()
+
+	if rem > 0 {
+		log.Infof("Waiting %v for previous lease to expire before continuing reconciliation", rem)
+		<-time.After(rem)
+	}
+
+	return l
+}
+
+func renewLeadership(l lease.Lease, ttl time.Duration) lease.Lease {
+	err := l.Renew(ttl)
+	if err != nil {
+		log.Errorf("Engine leadership lost, renewal failed: %v", err)
+		return nil
+	}
+
+	log.Debugf("Engine leadership renewed")
+	return l
+}
+
+func (e *Engine) clusterState() (*clusterState, error) {
+	units, err := e.registry.Units()
+	if err != nil {
+		log.Errorf("Failed fetching Units from Registry: %v", err)
+		return nil, err
+	}
+
+	sUnits, err := e.registry.Schedule()
+	if err != nil {
+		log.Errorf("Failed fetching schedule from Registry: %v", err)
+		return nil, err
+	}
+
+	machines, err := e.registry.Machines()
+	if err != nil {
+		log.Errorf("Failed fetching Machines from Registry: %v", err)
+		return nil, err
+	}
+
+	return newClusterState(units, sUnits, machines), nil
+}
+
+func (e *Engine) unscheduleUnit(name, machID string) (err error) {
+	err = e.registry.UnscheduleUnit(name, machID)
+	if err != nil {
+		log.Errorf("Failed unscheduling Unit(%s) from Machine(%s): %v", name, machID, err)
+	} else {
+		log.Infof("Unscheduled Job(%s) from Machine(%s)", name, machID)
+	}
+	return
+}
+
+// attemptScheduleUnit tries to persist a scheduling decision in the
+// Registry, returning true on success. If any communication with the
+// Registry fails, false is returned.
+func (e *Engine) attemptScheduleUnit(name, machID string) bool {
+	err := e.registry.ScheduleUnit(name, machID)
+	if err != nil {
+		log.Errorf("Failed scheduling Unit(%s) to Machine(%s): %v", name, machID, err)
+		return false
+	}
+
+	log.Infof("Scheduled Unit(%s) to Machine(%s)", name, machID)
+	return true
 }

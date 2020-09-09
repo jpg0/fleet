@@ -12,30 +12,56 @@
 # Invoke ./cover for HTML output
 COVER=${COVER:-"-cover"}
 
+CDIR=$(cd `dirname "$0"` && pwd)
+cd "$CDIR"
+
 source ./build
 
-declare -a TESTPKGS=(agent config engine event fleetctl job machine pkg registry sign ssh unit)
+TESTABLE="agent api config engine fleetctl job machine pkg pkg/lease registry registry/rpc ssh systemd unit"
+FORMATTABLE="$TESTABLE client functional functional/platform heart server fleetd"
 
+# user has not provided PKG override
 if [ -z "$PKG" ]; then
-	GOFMTPATH="$TESTPKGS engine functional server fleet.go"
-	# prepend repo path to each package
-	TESTPKGS=${TESTPKGS[@]/#/${REPO_PATH}/}
+	TEST=$TESTABLE
+	FMT=$FORMATTABLE
+
+# user has provided PKG override
 else
-	GOFMTPATH="$TESTPKGS"
 	# strip out slashes and dots from PKG=./foo/
-	TESTPKGS=${PKG//\//}
-	TESTPKGS=${TESTPKGS//./}
-	TESTPKGS=${TESTPKGS/#/${REPO_PATH}/}
+	TEST=${PKG//\//}
+	TEST=${TEST//./}
+
+	# only run gofmt on packages provided by user
+	FMT="$TEST"
 fi
 
+# split TEST into an array and prepend REPO_PATH to each local package
+split=(${TEST// / })
+TEST=${split[@]/#/${REPO_PATH}/}
+
 echo "Running tests..."
-go test -i ${TESTPKGS}
-go test ${COVER} $@ ${TESTPKGS}
+go test ${COVER} $@ ${TEST}
 
 echo "Checking gofmt..."
-fmtRes=$(gofmt -l $GOFMTPATH)
+fmtRes=$(gofmt -l $FMT)
 if [ -n "${fmtRes}" ]; then
 	echo -e "gofmt checking failed:\n${fmtRes}"
+	exit 255
+fi
+
+echo "Checking govet..."
+vetRes=$(go vet $TEST)
+if [ -n "${vetRes}" ]; then
+	echo -e "govet checking failed:\n${vetRes}"
+	exit 255
+fi
+
+echo "Checking for license header..."
+licRes=$(for file in $(find . -type f -iname '*.go' ! -path './vendor/*' ! -path './gopath/*' ); do
+		head -n3 "${file}" | grep -Eq "(Copyright|generated|GENERATED)" || echo -e "  ${file}"
+	done;)
+if [ -n "${licRes}" ]; then
+	echo -e "license header checking failed:\n${licRes}"
 	exit 255
 fi
 

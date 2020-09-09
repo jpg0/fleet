@@ -1,10 +1,25 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package main
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"strings"
+
+	"github.com/spf13/cobra"
 
 	"github.com/coreos/fleet/machine"
 )
@@ -15,21 +30,7 @@ const (
 
 var (
 	listMachinesFieldsFlag string
-	cmdListMachines        = &Command{
-		Name:    "list-machines",
-		Summary: "Enumerate the current hosts in the cluster",
-		Usage:   "[-l|--full] [--no-legend]",
-		Description: `Lists all active machines within the cluster. Previously active machines will not appear in this list.
-
-For easily parsable output, you can remove the column headers:
-	fleetctl list-machines --no-legend
-
-Output the list without truncation:
-	fleetctl list-machines --full`,
-		Run: runListMachines,
-	}
-
-	listMachinesFields = map[string]machineToField{
+	listMachinesFields     = map[string]machineToField{
 		"machine": func(ms *machine.MachineState, full bool) string {
 			return machineIDLegend(*ms, full)
 		},
@@ -50,78 +51,85 @@ Output the list without truncation:
 
 type machineToField func(ms *machine.MachineState, full bool) string
 
-func init() {
-	cmdListMachines.Flags.BoolVar(&sharedFlags.Full, "full", false, "Do not ellipsize fields on output")
-	cmdListMachines.Flags.BoolVar(&sharedFlags.Full, "l", false, "Shorthand for --full")
-	cmdListMachines.Flags.BoolVar(&sharedFlags.NoLegend, "no-legend", false, "Do not print a legend (column headers)")
-	cmdListMachines.Flags.StringVar(&listMachinesFieldsFlag, "fields", defaultListMachinesFields, fmt.Sprintf("Columns to print for each Machine. Valid fields are %q", strings.Join(machineToFieldKeys(listMachinesFields), ",")))
+var cmdListMachines = &cobra.Command{
+	Use:   "list-machines [-l|--full] [--no-legend]",
+	Short: "Enumerate the current hosts in the cluster",
+	Long: `Lists all active machines within the cluster. Previously active machines will not appear in this list.
+
+For easily parsable output, you can remove the column headers:
+fleetctl list-machines --no-legend
+
+Output the list without truncation:
+fleetctl list-machines --full`,
+	Run: runWrapper(runListMachines),
 }
 
-func runListMachines(args []string) (exit int) {
+func init() {
+	cmdFleet.AddCommand(cmdListMachines)
+
+	cmdListMachines.Flags().BoolVar(&sharedFlags.Full, "full", false, "Do not ellipsize fields on output")
+	cmdListMachines.Flags().BoolVar(&sharedFlags.Full, "l", false, "Shorthand for --full")
+	cmdListMachines.Flags().BoolVar(&sharedFlags.NoLegend, "no-legend", false, "Do not print a legend (column headers)")
+	cmdListMachines.Flags().StringVar(&listMachinesFieldsFlag, "fields", defaultListMachinesFields, fmt.Sprintf("Columns to print for each Machine. Valid fields are %q", strings.Join(machineToFieldKeys(listMachinesFields), ",")))
+}
+
+func runListMachines(cCmd *cobra.Command, args []string) (exit int) {
 	if listMachinesFieldsFlag == "" {
-		fmt.Fprintf(os.Stderr, "Must define output format\n")
+		stderr("Must define output format")
 		return 1
 	}
 
 	cols := strings.Split(listMachinesFieldsFlag, ",")
 	for _, s := range cols {
 		if _, ok := listMachinesFields[s]; !ok {
-			fmt.Fprintf(os.Stderr, "Invalid key in output format: %q\n", s)
+			stderr("Invalid key in output format: %q", s)
 			return 1
 		}
 	}
 
-	machines, sortable, err := findAllMachines()
+	machines, err := cAPI.Machines()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error retrieving list of active machines: %v\n", err)
+		stderr("Error retrieving list of active machines from fleet API (%v)", err)
+		stderr("Possible issues:")
+		stderr("  etcd is unhealthy and/or lost quorum")
+		stderr("  connection cannot be established to any etcd servers")
 		return 1
 	}
 
-	if !sharedFlags.NoLegend {
+	noLegend, _ := cCmd.Flags().GetBool("no-legend")
+	if !noLegend {
 		fmt.Fprintln(out, strings.ToUpper(strings.Join(cols, "\t")))
 	}
 
-	for _, name := range sortable {
+	full, _ := cCmd.Flags().GetBool("full")
+	for _, ms := range machines {
+		ms := ms
 		var f []string
-		ms := machines[name]
 		for _, c := range cols {
-			f = append(f, listMachinesFields[c](&ms, sharedFlags.Full))
+			f = append(f, listMachinesFields[c](&ms, full))
 		}
 		fmt.Fprintln(out, strings.Join(f, "\t"))
 	}
 
 	out.Flush()
-	return
+
+	return 0
 }
 
 func formatMetadata(metadata map[string]string) string {
 	pairs := make([]string, len(metadata))
 	idx := 0
-	for key, value := range metadata {
+	var sorted sort.StringSlice
+	for k := range metadata {
+		sorted = append(sorted, k)
+	}
+	sorted.Sort()
+	for _, key := range sorted {
+		value := metadata[key]
 		pairs[idx] = fmt.Sprintf("%s=%s", key, value)
 		idx++
 	}
-	return strings.Join(pairs, ", ")
-}
-
-// findAllMachines returns a map describing all the machines in the Registry, and a
-// sort.StringSlice indicating their sorted order (based on their respective
-// machine IDs). It returns any error encountered in communicating with the Registry.
-func findAllMachines() (machines map[string]machine.MachineState, sortable sort.StringSlice, err error) {
-	machines = make(map[string]machine.MachineState, 0)
-	mm, err := registryCtl.GetActiveMachines()
-	if err != nil {
-		return
-	}
-
-	for _, m := range mm {
-		machines[m.ID] = m
-		sortable = append(sortable, m.ID)
-	}
-
-	sortable.Sort()
-
-	return
+	return strings.Join(pairs, ",")
 }
 
 func machineToFieldKeys(m map[string]machineToField) (keys []string) {

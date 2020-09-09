@@ -1,26 +1,54 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package config
 
 import (
-	"flag"
-	"io/ioutil"
-	"log"
-	"os"
-	"strconv"
 	"strings"
 
-	"github.com/coreos/fleet/third_party/github.com/coreos/go-etcd/etcd"
-	"github.com/coreos/fleet/third_party/github.com/golang/glog"
+	"github.com/coreos/fleet/machine"
 )
 
 type Config struct {
-	EtcdServers        []string
-	EtcdKeyPrefix      string
-	PublicIP           string
-	Verbosity          int
-	RawMetadata        string
-	AgentTTL           string
-	VerifyUnits        bool
-	AuthorizedKeysFile string
+	EtcdServers             []string
+	EtcdUsername            string
+	EtcdPassword            string
+	EtcdKeyPrefix           string
+	EtcdKeyFile             string
+	EtcdCertFile            string
+	EtcdCAFile              string
+	EtcdRequestTimeout      float64
+	EngineReconcileInterval float64
+	PublicIP                string
+	Verbosity               int
+	RawMetadata             string
+	AgentTTL                string
+	TokenLimit              int
+	DisableEngine           bool
+	DisableWatches          bool
+	EnableGRPC              bool
+	VerifyUnits             bool
+	UnitsDirectory          string
+	SystemdUser             bool
+	AuthorizedKeysFile      string
+}
+
+func (c *Config) Capabilities() machine.Capabilities {
+	return machine.Capabilities{
+		machine.CapDISABLE_ENGINE: c.DisableEngine,
+		machine.CapGRPC:           c.EnableGRPC,
+	}
 }
 
 func (c *Config) Metadata() map[string]string {
@@ -39,24 +67,4 @@ func (c *Config) Metadata() map[string]string {
 	}
 
 	return meta
-}
-
-// UpdateLoggingFlagsFromConfig extracts the logging-related options from
-// the provided config and sets flags in the given flagset
-func UpdateLoggingFlagsFromConfig(flagset *flag.FlagSet, conf *Config) {
-	err := flagset.Lookup("v").Value.Set(strconv.Itoa(conf.Verbosity))
-	if err != nil {
-		glog.Errorf("Failed to apply config.Verbosity to flag.v: %v", err)
-	}
-
-	err = flagset.Lookup("logtostderr").Value.Set("true")
-	if err != nil {
-		glog.Errorf("Failed to set flag.logtostderr to true: %v", err)
-	}
-
-	if conf.Verbosity > 2 {
-		etcd.SetLogger(log.New(os.Stdout, "go-etcd", log.LstdFlags))
-	} else {
-		etcd.SetLogger(log.New(ioutil.Discard, "go-etcd", log.LstdFlags))
-	}
 }

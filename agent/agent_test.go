@@ -1,193 +1,161 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package agent
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/coreos/fleet/job"
 	"github.com/coreos/fleet/machine"
+	"github.com/coreos/fleet/registry"
 	"github.com/coreos/fleet/unit"
 )
 
-func newTestJobWithMachineMetadata(metadata string) *job.Job {
+func newTestUnitFromUnitContents(t *testing.T, name, contents string) *job.Unit {
+	j := newTestJobFromUnitContents(t, name, contents)
+	return &job.Unit{
+		Name: j.Name,
+		Unit: j.Unit,
+	}
+}
+
+func newTestJobFromUnitContents(t *testing.T, name, contents string) *job.Job {
+	u, err := unit.NewUnitFile(contents)
+	if err != nil {
+		t.Fatalf("error creating Unit from %q: %v", contents, err)
+	}
+	j := job.NewJob(name, *u)
+	if j == nil {
+		t.Fatalf("error creating Job %q from %q", name, u)
+	}
+	return j
+}
+
+func newNamedTestJobWithXFleetValues(t *testing.T, name, metadata string) *job.Job {
 	contents := fmt.Sprintf(`
 [X-Fleet]
 %s
 `, metadata)
-
-	return job.NewJob("pong.service", *unit.NewUnit(contents))
+	return newTestJobFromUnitContents(t, name, contents)
 }
 
-func TestAbleToRunConditionMachineIDMatch(t *testing.T) {
-	u := unit.NewUnit(`[X-Fleet]
-X-ConditionMachineID=XYZ
-`)
-	job := job.NewJob("example.service", *u)
+func newTestJobWithXFleetValues(t *testing.T, metadata string) *job.Job {
+	return newNamedTestJobWithXFleetValues(t, "pong.service", metadata)
+}
 
-	mach := &machine.FakeMachine{machine.MachineState{ID: "XYZ"}}
-	agent := Agent{Machine: mach, state: NewState()}
-	if !agent.ableToRun(job) {
-		t.Fatalf("Agent should be able to run job")
+func TestAgentLoadUnloadUnit(t *testing.T) {
+	uManager := unit.NewFakeUnitManager()
+	usGenerator := unit.NewUnitStateGenerator(uManager)
+	fReg := registry.NewFakeRegistry()
+	mach := &machine.FakeMachine{MachineState: machine.MachineState{ID: "XXX"}}
+	a := New(uManager, usGenerator, fReg, mach, time.Second)
+
+	u := newTestUnitFromUnitContents(t, "foo.service", "")
+	err := a.loadUnit(u)
+	if err != nil {
+		t.Fatalf("Failed calling Agent.loadUnit: %v", err)
 	}
-}
 
-func TestAbleToRunConditionMachineIDMismatch(t *testing.T) {
-	u := unit.NewUnit(`[X-Fleet]
-X-ConditionMachineID=XYZ
-`)
-	job := job.NewJob("example.service", *u)
-
-	mach := &machine.FakeMachine{machine.MachineState{ID: "123"}}
-	agent := Agent{Machine: mach, state: NewState()}
-	if agent.ableToRun(job) {
-		t.Fatalf("Agent should not be able to run job")
+	units, err := a.units()
+	if err != nil {
+		t.Fatalf("Failed calling Agent.units: %v", err)
 	}
-}
 
-// Assert that an existing conflict is triggered against the potential job name
-func TestHasConflictExistingMatch(t *testing.T) {
-	state := NewState()
-
-	u := unit.NewUnit(`[X-Fleet]
-X-Conflicts=other.service
-`)
-	j := job.NewJob("example.service", *u)
-	state.TrackJob(j)
-	state.SetTargetState(j.Name, job.JobStateLoaded)
-
-	agent := Agent{state: state}
-
-	matched, name := agent.HasConflict("other.service", []string{})
-	if !matched {
-		t.Errorf("Expected conflict with 'example.service', no conflict reported")
-	} else if name != "example.service" {
-		t.Errorf("Expected conflict with 'example.service', but conflict found with %s", name)
+	jsLoaded := job.JobStateLoaded
+	expectUnits := unitStates{
+		"foo.service": unitState{
+			state: jsLoaded,
+		},
 	}
-}
 
-// Assert that a potential conflict is triggered against the existing job name
-func TestHasConflictPotentialMatch(t *testing.T) {
-	state := NewState()
+	if !reflect.DeepEqual(expectUnits, units) {
+		t.Fatalf("Received unexpected collection of Units: %#v\nExpected: %#v", units, expectUnits)
+	}
 
-	u := unit.NewUnit(`[X-Fleet]`)
-	j := job.NewJob("example.service", *u)
-	state.TrackJob(j)
-	state.SetTargetState(j.Name, job.JobStateLoaded)
+	err = a.unloadUnit("foo.service")
+	if err != nil {
+		t.Fatalf("Failed calling Agent.unloadUnit: %v", err)
+	}
 
-	agent := Agent{state: state}
+	units, err = a.units()
+	if err != nil {
+		t.Fatalf("Failed calling Agent.units: %v", err)
+	}
 
-	matched, name := agent.HasConflict("other.service", []string{"example.service"})
-	if !matched {
-		t.Errorf("Expected conflict with 'example.service', no conflict reported")
-	} else if name != "example.service" {
-		t.Errorf("Expected conflict with 'example.service', but conflict found with %s", name)
+	expectUnits = unitStates{}
+	if !reflect.DeepEqual(expectUnits, units) {
+		t.Fatalf("Received unexpected collection of Units: %#v\nExpected: %#v", units, expectUnits)
 	}
 }
 
-// Assert that existing jobs and potential jobs that do not conflict do not
-// trigger a match
-func TestHasConflictNoMatch(t *testing.T) {
-	state := NewState()
+func TestAgentLoadStartStopUnit(t *testing.T) {
+	uManager := unit.NewFakeUnitManager()
+	usGenerator := unit.NewUnitStateGenerator(uManager)
+	fReg := registry.NewFakeRegistry()
+	mach := &machine.FakeMachine{MachineState: machine.MachineState{ID: "XXX"}}
+	a := New(uManager, usGenerator, fReg, mach, time.Second)
 
-	u := unit.NewUnit(`[X-Fleet]`)
-	j := job.NewJob("example.service", *u)
-	state.TrackJob(j)
-	state.SetTargetState(j.Name, job.JobStateLoaded)
+	u := newTestUnitFromUnitContents(t, "foo.service", "")
 
-	agent := Agent{state: state}
-
-	matched, name := agent.HasConflict("other.service", []string{})
-	if matched {
-		t.Errorf("Expected no match, but got conflict with %s", name)
-	}
-}
-
-// Assert that our glob-parser can handle relatively-complex matching
-func TestHasConflictComplexGlob(t *testing.T) {
-	state := NewState()
-
-	u := unit.NewUnit(`[X-Fleet]
-X-Conflicts=*.[1-9].service
-`)
-	j := job.NewJob("example.service", *u)
-	state.TrackJob(j)
-	state.SetTargetState(j.Name, job.JobStateLoaded)
-
-	agent := Agent{state: state}
-
-	matched, name := agent.HasConflict("other.2.service", []string{})
-	if !matched {
-		t.Errorf("Expected conflict with 'example.service', but no conflict reported")
-	} else if name != "example.service" {
-		t.Errorf("Expected conflict with 'example.service', but conflict found with %s", name)
-	}
-}
-
-func TestHasConflictIgnoresUnscheduledJobs(t *testing.T) {
-	state := NewState()
-
-	u := unit.NewUnit(`[X-Fleet]
-X-Conflicts=other.service
-`)
-	j := job.NewJob("example.service", *u)
-	state.TrackJob(j)
-	state.SetTargetState(j.Name, job.JobStateInactive)
-
-	agent := Agent{state: state}
-
-	matched, name := agent.HasConflict("other.service", []string{})
-	if matched {
-		t.Errorf("Expected no conflict, but got conflict with %s", name)
-	}
-}
-
-func TestHasConflictIgnoresBids(t *testing.T) {
-	state := NewState()
-
-	u := unit.NewUnit(`[X-Fleet]
-X-Conflicts=other.service
-`)
-	j := job.NewJob("example.service", *u)
-	state.TrackJob(j)
-	state.TrackBid(j.Name)
-
-	agent := Agent{state: state}
-
-	matched, name := agent.HasConflict("other.service", []string{})
-	if matched {
-		t.Errorf("Expected no conflict, but got conflict with %s", name)
-	}
-}
-
-func TestAbleToRunWithConditionMachineMetadata(t *testing.T) {
-	metadataAbleToRunExamples := []struct {
-		C string
-		A bool
-	}{
-		// valid metadata
-		{`X-ConditionMachineMetadata=region=us-west-1`, true},
-		{`X-ConditionMachineMetadata= "region=us-east-1" "region=us-west-1"`, true},
-		{`X-ConditionMachineMetadata=region=us-east-1
-X-ConditionMachineMetadata=region=us-west-1`, true},
-		{`X-ConditionMachineMetadata=region=us-east-1`, false},
-
-		// ignored/invalid metadata
-		{`X-ConditionMachineMetadata=us-west-1`, true},
-		{`X-ConditionMachineMetadata==us-west-1`, true},
-		{`X-ConditionMachineMetadata=region=`, true},
+	err := a.loadUnit(u)
+	if err != nil {
+		t.Fatalf("Failed calling Agent.loadUnit: %v", err)
 	}
 
-	metadata := map[string]string{
-		"region": "us-west-1",
+	err = a.startUnit("foo.service")
+	if err != nil {
+		t.Fatalf("Failed starting unit foo.service: %v", err)
 	}
-	ms := machine.MachineState{Metadata: metadata}
-	agent := &Agent{Machine: &machine.FakeMachine{ms}, state: NewState()}
 
-	for i, e := range metadataAbleToRunExamples {
-		job := newTestJobWithMachineMetadata(e.C)
-		g := agent.ableToRun(job)
-		if g != e.A {
-			t.Errorf("Unexpected output %d, content: %q\n\tgot %t, want %t\n", i, e.C, g, e.A)
-		}
+	units, err := a.units()
+	if err != nil {
+		t.Fatalf("Failed calling Agent.units: %v", err)
+	}
+
+	jsLaunched := job.JobStateLaunched
+	expectUnits := unitStates{
+		"foo.service": unitState{
+			state: jsLaunched,
+		},
+	}
+
+	if !reflect.DeepEqual(expectUnits, units) {
+		t.Fatalf("Received unexpected collection of Units: %#v\nExpected: %#v", units, expectUnits)
+	}
+
+	err = a.stopUnit("foo.service")
+	if err != nil {
+		t.Fatalf("Failed stopping unit foo.service: %v", err)
+	}
+
+	units, err = a.units()
+	if err != nil {
+		t.Fatalf("Failed calling Agent.units: %v", err)
+	}
+
+	jsLoaded := job.JobStateLoaded
+	expectUnits = unitStates{
+		"foo.service": unitState{
+			state: jsLoaded,
+		},
+	}
+
+	if !reflect.DeepEqual(expectUnits, units) {
+		t.Fatalf("Received unexpected collection of Units: %#v\nExpected: %#v", units, expectUnits)
 	}
 }

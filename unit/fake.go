@@ -1,7 +1,23 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package unit
 
 import (
 	"sync"
+
+	"github.com/coreos/fleet/pkg"
 )
 
 func NewFakeUnitManager() *FakeUnitManager {
@@ -13,7 +29,7 @@ type FakeUnitManager struct {
 	u map[string]bool
 }
 
-func (fum *FakeUnitManager) Load(name string, u Unit) error {
+func (fum *FakeUnitManager) Load(name string, u UnitFile) error {
 	fum.Lock()
 	defer fum.Unlock()
 
@@ -21,15 +37,20 @@ func (fum *FakeUnitManager) Load(name string, u Unit) error {
 	return nil
 }
 
-func (fum *FakeUnitManager) Unload(name string) {
+func (fum *FakeUnitManager) ReloadUnitFiles() error {
+	return nil
+}
+
+func (fum *FakeUnitManager) Unload(name string) error {
 	fum.Lock()
 	defer fum.Unlock()
 
 	delete(fum.u, name)
+	return nil
 }
 
-func (fum *FakeUnitManager) Start(string) {}
-func (fum *FakeUnitManager) Stop(string)  {}
+func (fum *FakeUnitManager) TriggerStart(string) error { return nil }
+func (fum *FakeUnitManager) TriggerStop(string) error  { return nil }
 
 func (fum *FakeUnitManager) Units() ([]string, error) {
 	fum.RLock()
@@ -47,9 +68,27 @@ func (fum *FakeUnitManager) GetUnitState(name string) (us *UnitState, err error)
 	defer fum.RUnlock()
 
 	if _, ok := fum.u[name]; ok {
-		us = &UnitState{"loaded", "active", "running", nil}
+		us = &UnitState{
+			LoadState:   "loaded",
+			ActiveState: "active",
+			SubState:    "running",
+		}
 	}
 	return
+}
+
+func (fum *FakeUnitManager) GetUnitStates(filter pkg.Set) (map[string]*UnitState, error) {
+	fum.RLock()
+	defer fum.RUnlock()
+
+	states := make(map[string]*UnitState)
+	for _, name := range filter.Values() {
+		if _, ok := fum.u[name]; ok {
+			states[name] = &UnitState{"loaded", "active", "running", "", "", name}
+		}
+	}
+
+	return states, nil
 }
 
 func (fum *FakeUnitManager) MarshalJSON() ([]byte, error) {

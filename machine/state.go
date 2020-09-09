@@ -1,6 +1,18 @@
-package machine
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-import "github.com/coreos/fleet/resource"
+package machine
 
 const (
 	shortIDLen = 8
@@ -9,24 +21,26 @@ const (
 // MachineState represents a point-in-time snapshot of the
 // state of the local host.
 type MachineState struct {
-	ID             string
-	PublicIP       string
-	Metadata       map[string]string
-	Version        string
-	TotalResources resource.ResourceTuple
+	ID           string
+	PublicIP     string
+	Metadata     map[string]string
+	Capabilities Capabilities
+	Version      string
 }
 
-func (s MachineState) ShortID() string {
-	if len(s.ID) <= shortIDLen {
-		return s.ID
+func (ms MachineState) ShortID() string {
+	if len(ms.ID) <= shortIDLen {
+		return ms.ID
 	}
-	return s.ID[0:shortIDLen]
+	return ms.ID[0:shortIDLen]
 }
 
-func (s MachineState) MatchID(ID string) bool {
-	return s.ID == ID || s.ShortID() == ID
+func (ms MachineState) MatchID(ID string) bool {
+	return ms.ID == ID || ms.ShortID() == ID
 }
 
+// stackState is used to merge two MachineStates. Values configured on the top
+// MachineState always take precedence over those on the bottom.
 func stackState(top, bottom MachineState) MachineState {
 	state := MachineState(bottom)
 
@@ -38,23 +52,15 @@ func stackState(top, bottom MachineState) MachineState {
 		state.ID = top.ID
 	}
 
-	if top.TotalResources.Cores > 0 {
-		state.TotalResources.Cores = top.TotalResources.Cores
-	}
-
-	if top.TotalResources.Memory > 0 {
-		state.TotalResources.Memory = top.TotalResources.Memory
-	}
-
-	if top.TotalResources.Disk > 0 {
-		state.TotalResources.Disk = top.TotalResources.Disk
-	}
-
 	//FIXME: This will *always* overwrite the bottom's metadata,
 	// but the only use-case we have today does not ever have
 	// metadata on the bottom.
 	if len(top.Metadata) > 0 {
 		state.Metadata = top.Metadata
+	}
+
+	if len(top.Capabilities) > 0 {
+		state.Capabilities = top.Capabilities
 	}
 
 	if top.Version != "" {

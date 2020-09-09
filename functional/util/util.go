@@ -1,3 +1,17 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package util
 
 import (
@@ -9,6 +23,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/pborman/uuid"
 )
 
 var fleetctlBinPath string
@@ -63,115 +79,60 @@ func RunFleetctlWithInput(input string, args ...string) (string, string, error) 
 	return stdoutBytes.String(), stderrBytes.String(), err
 }
 
-// Wait up to 10s to find the specified number of machines, retrying periodically.
-func WaitForNMachines(fleetctl fleetfunc, count int) ([]string, error) {
-	var machines []string
-
-	timeout := 10 * time.Second
-	alarm := time.After(timeout)
-
-	ticker := time.Tick(250 * time.Millisecond)
-loop:
-	for {
-		select {
-		case <-alarm:
-			return machines, fmt.Errorf("failed to find %d machines within %v", count, timeout)
-		case <-ticker:
-			stdout, _, err := fleetctl("list-machines", "--no-legend", "--full")
-			stdout = strings.TrimSpace(stdout)
-			if err != nil {
-				continue
-			}
-
-			found := 0
-			if stdout != "" {
-				machines = strings.Split(stdout, "\n")
-				found = len(machines)
-			}
-
-			if found != count {
-				continue
-			}
-
-			for k, v := range machines {
-				machines[k] = strings.SplitN(v, "\t", 2)[0]
-			}
-
-			break loop
-		}
-	}
-
-	return machines, nil
-}
-
-// WaitForNActiveUnits polls fleet for up to 10s, exiting when N units are
-// found to be in an active state. It returns a map of active units to
-// their target machines.
-func WaitForNActiveUnits(fleetctl fleetfunc, count int) (map[string]UnitState, error) {
-	var nactive int
+// ActiveToSingleStates takes a map of active states (such as that returned by
+// WaitForNActiveUnits) and ensures that each unit has at most a single active
+// state. It returns a mapping of unit name to a single UnitState.
+func ActiveToSingleStates(active map[string][]UnitState) (map[string]UnitState, error) {
 	states := make(map[string]UnitState)
-
-	timeout := 10 * time.Second
-	alarm := time.After(timeout)
-
-	ticker := time.Tick(250 * time.Millisecond)
-loop:
-	for {
-		select {
-		case <-alarm:
-			return nil, fmt.Errorf("failed to find %d active units within %v (last found: %d)", count, timeout, nactive)
-		case <-ticker:
-			stdout, _, err := fleetctl("list-units", "--no-legend", "--full")
-			stdout = strings.TrimSpace(stdout)
-			if stdout == "" || err != nil {
-				continue
-			}
-
-			lines := strings.Split(stdout, "\n")
-			allStates := parseUnitStates(lines)
-			active := filterActiveUnits(allStates)
-			nactive = len(active)
-			if nactive != count {
-				continue
-			}
-
-			for _, state := range active {
-				states[state.Name] = state
-			}
-			break loop
+	for name, us := range active {
+		if len(us) != 1 {
+			return nil, fmt.Errorf("unit %s running in multiple locations: %v", name, us)
 		}
+		states[name] = us[0]
 	}
-
 	return states, nil
 }
 
 type UnitState struct {
 	Name        string
-	JobState    string
 	ActiveState string
 	Machine     string
 }
 
-func parseUnitStates(units []string) map[string]UnitState {
-	states := make(map[string]UnitState)
+type UnitFileState struct {
+	Name         string
+	DesiredState string
+	State        string
+}
+
+func ParseUnitStates(units []string) (states []UnitState) {
 	for _, unit := range units {
-		cols := strings.SplitN(unit, "\t", 7)
-		if len(cols) == 7 {
-			machine := strings.SplitN(cols[6], "/", 2)[0]
-			states[cols[0]] = UnitState{cols[0], cols[2], cols[3], machine}
+		cols := strings.Fields(unit)
+		if len(cols) == 3 {
+			machine := strings.SplitN(cols[2], "/", 2)[0]
+			states = append(states, UnitState{cols[0], cols[1], machine})
 		}
 	}
 	return states
 }
 
-func filterActiveUnits(states map[string]UnitState) map[string]UnitState {
-	filtered := make(map[string]UnitState)
-	for unit, state := range states {
-		if state.ActiveState == "active" {
-			filtered[unit] = state
+func ParseUnitFileStates(units []string) (states []UnitFileState) {
+	for _, unit := range units {
+		cols := strings.Fields(unit)
+		if len(cols) == 3 {
+			states = append(states, UnitFileState{cols[0], cols[1], cols[2]})
 		}
 	}
-	return filtered
+	return states
+}
+
+func FilterActiveUnits(states []UnitState) (filtered []UnitState) {
+	for _, state := range states {
+		if state.ActiveState == "active" {
+			filtered = append(filtered, state)
+		}
+	}
+	return
 }
 
 // tempUnit creates a local unit file with the given contents, returning
@@ -193,4 +154,62 @@ func TempUnit(contents string) (string, error) {
 	}
 
 	return svc, nil
+}
+
+func WaitForState(stateCheckFunc func() bool) (time.Duration, error) {
+	timeout := 15 * time.Second
+	alarm := time.After(timeout)
+	ticker := time.Tick(250 * time.Millisecond)
+	for {
+		select {
+		case <-alarm:
+			// Generic message. Callers can build more specific ones using the returned timeout value.
+			return timeout, fmt.Errorf("Failed to reach expected state within %v.", timeout)
+		case <-ticker:
+			if stateCheckFunc() {
+				return timeout, nil
+			}
+		}
+	}
+}
+
+func NewMachineID() string {
+	// drop the standard separators to match systemd
+	return strings.Replace(uuid.New(), "-", "", -1)
+}
+
+// CopyFile()
+func CopyFile(newFile, oldFile string) error {
+	input, err := ioutil.ReadFile(oldFile)
+	if err != nil {
+		return err
+	}
+	err = ioutil.WriteFile(newFile, []byte(input), 0644)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// GenNewFleetService() is a helper for generating a temporary fleet service
+// that reads from oldFile, replaces oldVal with newVal, and stores the result
+// to newFile.
+func GenNewFleetService(newFile, oldFile, newVal, oldVal string) error {
+	input, err := ioutil.ReadFile(oldFile)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(input), "\n")
+
+	for i, line := range lines {
+		if strings.Contains(line, oldVal) {
+			lines[i] = strings.Replace(line, oldVal, newVal, len(oldVal))
+		}
+	}
+	output := strings.Join(lines, "\n")
+	err = ioutil.WriteFile(newFile, []byte(output), 0644)
+	if err != nil {
+		return err
+	}
+	return nil
 }

@@ -1,16 +1,30 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package registry
 
 import (
 	"errors"
+	"fmt"
 	"path"
-	"strings"
+	"sort"
 
-	etcdErr "github.com/coreos/fleet/third_party/github.com/coreos/etcd/error"
-	"github.com/coreos/fleet/third_party/github.com/coreos/go-etcd/etcd"
-	log "github.com/coreos/fleet/third_party/github.com/golang/glog"
+	etcd "github.com/coreos/etcd/client"
+	"golang.org/x/net/context"
 
-	"github.com/coreos/fleet/event"
 	"github.com/coreos/fleet/job"
+	"github.com/coreos/fleet/log"
 	"github.com/coreos/fleet/unit"
 )
 
@@ -18,128 +32,257 @@ const (
 	jobPrefix = "job"
 )
 
-// GetAllJobs lists all Jobs known by the Registry
-func (r *EtcdRegistry) GetAllJobs() ([]job.Job, error) {
-	var jobs []job.Job
-
-	key := path.Join(r.keyPrefix, jobPrefix)
-	resp, err := r.etcd.Get(key, true, true)
+// Schedule returns all ScheduledUnits known by fleet, ordered by name
+func (r *EtcdRegistry) Schedule() ([]job.ScheduledUnit, error) {
+	key := r.prefixed(jobPrefix)
+	opts := &etcd.GetOptions{
+		Sort:      true,
+		Recursive: true,
+	}
+	res, err := r.kAPI.Get(context.Background(), key, opts)
 	if err != nil {
-		if isKeyNotFound(err) {
+		if isEtcdError(err, etcd.ErrorCodeKeyNotFound) {
 			err = nil
 		}
-		return jobs, err
+		return nil, err
 	}
 
-	for _, dir := range resp.Node.Nodes {
-		for _, node := range dir.Nodes {
-			if !strings.HasSuffix(node.Key, "object") {
-				continue
-			}
+	heartbeats := make(map[string]string)
+	uMap := make(map[string]*job.ScheduledUnit)
 
-			j := r.getJobFromJSON(node.Value)
-			if j == nil {
-				continue
-			}
+	for _, dir := range res.Node.Nodes {
+		_, name := path.Split(dir.Key)
+		u := &job.ScheduledUnit{
+			Name:            name,
+			TargetMachineID: dirToTargetMachineID(dir),
+		}
+		heartbeats[name] = dirToHeartbeat(dir)
+		uMap[name] = u
+	}
 
-			jobs = append(jobs, *j)
+	states, err := r.statesByMUSKey()
+	if err != nil {
+		return nil, err
+	}
+
+	var sortable sort.StringSlice
+
+	// Determine the JobState of each ScheduledUnit
+	for name, su := range uMap {
+		sortable = append(sortable, name)
+		key := MUSKey{
+			MachID: su.TargetMachineID,
+			Name:   name,
+		}
+		us := states[key]
+		js := determineJobState(heartbeats[name], su.TargetMachineID, us)
+		su.State = &js
+	}
+	sortable.Sort()
+
+	units := make([]job.ScheduledUnit, 0, len(sortable))
+	for _, name := range sortable {
+		units = append(units, *uMap[name])
+	}
+	return units, nil
+}
+
+// Units lists all Units stored in the Registry, ordered by name. This includes both global and non-global units.
+func (r *EtcdRegistry) Units() ([]job.Unit, error) {
+	key := r.prefixed(jobPrefix)
+	opts := &etcd.GetOptions{
+		// We need Job Units to be sorted
+		Sort:      true,
+		Recursive: true,
+	}
+	res, err := r.kAPI.Get(context.Background(), key, opts)
+	if err != nil {
+		if isEtcdError(err, etcd.ErrorCodeKeyNotFound) {
+			err = nil
+		}
+		return nil, err
+	}
+
+	// Fetch all units by hash recursively to avoid sending N requests to Etcd.
+	hashToUnit, err := r.getAllUnitsHashMap()
+	if err != nil {
+		log.Errorf("failed fetching all Units from etcd: %v", err)
+		return nil, err
+	}
+	unitHashLookupFunc := func(hash unit.Hash) *unit.UnitFile {
+		stringHash := hash.String()
+		unit, ok := hashToUnit[stringHash]
+		if !ok {
+			log.Errorf("did not find Unit %v in list of all units", stringHash)
+			return nil
+		}
+		return unit
+	}
+
+	units := make([]job.Unit, 0)
+	for _, dir := range res.Node.Nodes {
+		u, err := r.dirToUnit(dir, unitHashLookupFunc)
+		if err != nil {
+			log.Errorf("Failed to parse Unit from etcd: %v", err)
+			continue
+		}
+		if u == nil {
+			continue
+		}
+
+		units = append(units, *u)
+	}
+
+	return units, nil
+}
+
+// Unit retrieves the Unit by the given name from the Registry. Returns nil if
+// no such Unit exists, and any error encountered.
+func (r *EtcdRegistry) Unit(name string) (*job.Unit, error) {
+	key := r.prefixed(jobPrefix, name)
+	opts := &etcd.GetOptions{
+		Recursive: true,
+	}
+	res, err := r.kAPI.Get(context.Background(), key, opts)
+	if err != nil {
+		if isEtcdError(err, etcd.ErrorCodeKeyNotFound) {
+			err = nil
+		}
+		return nil, err
+	}
+
+	return r.dirToUnit(res.Node, r.getUnitByHash)
+}
+
+// dirToUnit takes a Node containing a Job's constituent objects (in child
+// nodes) and returns a *job.Unit, or any error encountered
+func (r *EtcdRegistry) dirToUnit(dir *etcd.Node, unitHashLookupFunc func(unit.Hash) *unit.UnitFile) (*job.Unit, error) {
+	objKey := path.Join(dir.Key, "object")
+	var objNode *etcd.Node
+	for _, node := range dir.Nodes {
+		node := node
+		if node.Key == objKey {
+			objNode = node
+		}
+	}
+	if objNode == nil {
+		return nil, nil
+	}
+	u, err := r.getUnitFromObjectNode(objNode, unitHashLookupFunc)
+	if err != nil {
+		return nil, err
+	}
+	if u == nil {
+		return nil, fmt.Errorf("unable to parse Unit in Registry at key %s", objKey)
+	}
+	if tgtstate := dirToTargetState(dir); tgtstate != "" {
+		ts, err := job.ParseJobState(tgtstate)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse Unit(%s) target-state: %v", u.Name, err)
+		}
+		u.TargetState = ts
+	}
+
+	return u, nil
+}
+
+// ScheduledUnit retrieves the ScheduledUnit by the given name from the Registry.
+// Returns nil if no such ScheduledUnit exists, and any error encountered.
+func (r *EtcdRegistry) ScheduledUnit(name string) (*job.ScheduledUnit, error) {
+	key := r.prefixed(jobPrefix, name)
+	opts := &etcd.GetOptions{
+		Recursive: true,
+	}
+	res, err := r.kAPI.Get(context.Background(), key, opts)
+	if err != nil {
+		if isEtcdError(err, etcd.ErrorCodeKeyNotFound) {
+			err = nil
+		}
+		return nil, err
+	}
+
+	su := job.ScheduledUnit{
+		Name:            name,
+		TargetMachineID: dirToTargetMachineID(res.Node),
+	}
+
+	var us *unit.UnitState
+	if len(su.TargetMachineID) > 0 {
+		us, err = r.getUnitState(name, su.TargetMachineID)
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	return jobs, nil
+	js := determineJobState(dirToHeartbeat(res.Node), su.TargetMachineID, us)
+	su.State = &js
+
+	return &su, nil
 }
 
-// GetJobTarget looks up where the given job is scheduled. If the job has
-// been scheduled, the ID the target machine is returned. Otherwise, an
-// empty string is returned.
-func (r *EtcdRegistry) GetJobTarget(jobName string) (string, error) {
-	// Figure out to which Machine this Job is scheduled
-	key := r.jobTargetAgentPath(jobName)
-	resp, err := r.etcd.Get(key, false, true)
-	if err != nil {
-		return "", err
+func (r *EtcdRegistry) UnscheduleUnit(name, machID string) error {
+	key := r.jobTargetAgentPath(name)
+	opts := &etcd.DeleteOptions{
+		PrevValue: machID,
 	}
-
-	return resp.Node.Value, nil
-}
-
-func (r *EtcdRegistry) ClearJobTarget(jobName, machID string) error {
-	key := r.jobTargetAgentPath(jobName)
-	_, err := r.etcd.CompareAndDelete(key, machID, 0)
-	if isKeyNotFound(err) {
+	_, err := r.kAPI.Delete(context.Background(), key, opts)
+	if isEtcdError(err, etcd.ErrorCodeKeyNotFound) {
 		err = nil
 	}
+
 	return err
 }
 
-// GetJob looks for a Job of the given name in the Registry. It returns a fully
-// hydrated Job on success, or nil on any kind of failure.
-func (r *EtcdRegistry) GetJob(jobName string) (j *job.Job, err error) {
-	key := path.Join(r.keyPrefix, jobPrefix, jobName, "object")
-	resp, err := r.etcd.Get(key, false, true)
-	if err != nil {
-		if isKeyNotFound(err) {
-			err = nil
+// getValueInDir takes a *etcd.Node containing a job, and returns the value of
+// the given key within that directory (i.e. child node) as a string, or an
+// empty string if the child node does not exist
+func getValueInDir(dir *etcd.Node, key string) (value string) {
+	valPath := path.Join(dir.Key, key)
+	for _, node := range dir.Nodes {
+		if node.Key == valPath {
+			value = node.Value
+			break
 		}
-		return
-	}
-
-	j = r.getJobFromJSON(resp.Node.Value)
-	if j == nil {
-		log.V(1).Infof("Error unmarshaling Job(%s): %v", jobName, err)
 	}
 	return
 }
 
-func (r *EtcdRegistry) getJobFromJSON(val string) *job.Job {
-	var jm jobModel
-	if err := unmarshal(val, &jm); err != nil {
-		return nil
-	}
-
-	return r.getJobFromModel(jm)
+func dirToTargetMachineID(dir *etcd.Node) (tgtMID string) {
+	return getValueInDir(dir, "target")
 }
 
-func (r *EtcdRegistry) getJobFromModel(jm jobModel) *job.Job {
+func dirToTargetState(dir *etcd.Node) (tgtState string) {
+	return getValueInDir(dir, "target-state")
+}
+
+func dirToHeartbeat(dir *etcd.Node) (heartbeat string) {
+	return getValueInDir(dir, "job-state")
+}
+
+// getUnitFromObject takes a *etcd.Node containing a Unit's jobModel, and
+// instantiates and returns a representative *job.Unit, transitively fetching the
+// associated UnitFile as necessary
+func (r *EtcdRegistry) getUnitFromObjectNode(node *etcd.Node, unitHashLookupFunc func(unit.Hash) *unit.UnitFile) (*job.Unit, error) {
 	var err error
-	var unit *unit.Unit
-
-	// New-style Jobs should have a populated UnitHash, and the contents of the Unit are stored separately in the Registry
-	if !jm.UnitHash.Empty() {
-		unit = r.getUnitByHash(jm.UnitHash)
-		if unit == nil {
-			log.Warningf("No Unit found in Registry for Job(%s)", jm.Name)
-			return nil
-		}
-		if unit.Hash() != jm.UnitHash {
-			log.Errorf("Unit Hash %s does not match expected %s for Job(%s)!", unit.Hash(), jm.UnitHash, jm.Name)
-			return nil
-		}
-		log.V(2).Infof("Got Unit for Job(%s) from registry", jm.Name)
-	} else {
-		// Old-style Jobs had "Payloads" instead of Units, also stored separately in the Registry
-		log.V(2).Infof("Legacy Job(%s) has no PayloadHash - looking for associated Payload", jm.Name)
-		unit, err = r.getUnitFromLegacyPayload(jm.Name)
-		if err != nil {
-			log.Errorf("Error retrieving legacy payload for Job(%s)", jm.Name)
-			return nil
-		} else if unit == nil {
-			log.Warningf("No Payload found in Registry for Job(%s)", jm.Name)
-			return nil
-		}
-
-		log.Infof("Migrating legacy Payload(%s)", jm.Name)
-		if err := r.storeOrGetUnit(*unit); err != nil {
-			log.Warningf("Unable to migrate legacy Payload: %v", err)
-		}
+	var jm jobModel
+	if err = unmarshal(node.Value, &jm); err != nil {
+		return nil, err
 	}
 
-	j := job.NewJob(jm.Name, *unit)
+	var unit *unit.UnitFile
 
-	j.UnitState = r.getUnitState(jm.Name)
-	j.State = r.determineJobState(jm.Name)
+	unit = unitHashLookupFunc(jm.UnitHash)
+	if unit == nil {
+		log.Warningf("No Unit found in Registry for Job(%s)", jm.Name)
+		return nil, nil
+	}
 
-	return j
+	ju := &job.Unit{
+		Name: jm.Name,
+		Unit: *unit,
+	}
+	return ju, nil
+
 }
 
 // jobModel is used for serializing and deserializing Jobs stored in the Registry
@@ -148,198 +291,75 @@ type jobModel struct {
 	UnitHash unit.Hash
 }
 
-// DestroyJob removes a Job object from the repository, along with any legacy
-// associated Payload and SignatureSet. It does not yet remove underlying
-// Units from the repository.
-func (r *EtcdRegistry) DestroyJob(jobName string) error {
-	key := path.Join(r.keyPrefix, jobPrefix, jobName)
-	r.etcd.Delete(key, true)
-	// TODO(jonboulle): add unit reference counting and actually destroying Units
-	r.destroyLegacyPayload(jobName)
-	r.destroySignatureSetOfJob(jobName)
-	// TODO(jonboulle): handle errors
-	return nil
-}
+// DestroyUnit removes a Job object from the repository. It does not yet remove underlying
+// UnitFiles from the repository.
+func (r *EtcdRegistry) DestroyUnit(name string) error {
+	key := r.prefixed(jobPrefix, name)
+	opts := &etcd.DeleteOptions{
+		Recursive: true,
+	}
+	_, err := r.kAPI.Delete(context.Background(), key, opts)
+	if err != nil {
+		if isEtcdError(err, etcd.ErrorCodeKeyNotFound) {
+			err = errors.New("job does not exist")
+		}
 
-// destroyLegacyPayload removes an old-style Payload from the registry
-func (r *EtcdRegistry) destroyLegacyPayload(payloadName string) {
-	key := path.Join(r.keyPrefix, payloadPrefix, payloadName)
-	r.etcd.Delete(key, false)
-}
-
-// CreateJob attempts to store a Job and its associated Unit in the registry
-func (r *EtcdRegistry) CreateJob(j *job.Job) (err error) {
-	if err := r.storeOrGetUnit(j.Unit); err != nil {
 		return err
 	}
 
-	key := path.Join(r.keyPrefix, jobPrefix, j.Name, "object")
+	// TODO(jonboulle): add unit reference counting and actually destroying Units
+	return nil
+}
+
+// CreateUnit attempts to store a Unit and its associated unit file in the registry
+func (r *EtcdRegistry) CreateUnit(u *job.Unit) error {
+	if err := r.storeOrGetUnitFile(u.Unit); err != nil {
+		return err
+	}
 
 	jm := jobModel{
-		Name:     j.Name,
-		UnitHash: j.UnitHash,
+		Name:     u.Name,
+		UnitHash: u.Unit.Hash(),
 	}
-	json, err := marshal(jm)
+	val, err := marshal(jm)
 	if err != nil {
-		return
+		return err
 	}
 
-	_, err = r.etcd.Create(key, json, 0)
-	if err != nil && err.(*etcd.EtcdError).ErrorCode == etcdErr.EcodeNodeExist {
-		err = errors.New("job already exists")
+	opts := &etcd.SetOptions{
+		// Since we support replacing units, just ignore previous
+		// job keys if they exist, this allows us to update the
+		// job object key with a new unit.
+		PrevExist: etcd.PrevIgnore,
+	}
+	key := r.prefixed(jobPrefix, u.Name, "object")
+	_, err = r.kAPI.Set(context.Background(), key, val, opts)
+	if err != nil {
+		return err
 	}
 
-	return
+	return r.SetUnitTargetState(u.Name, u.TargetState)
 }
 
-func (r *EtcdRegistry) GetJobTargetState(jobName string) (*job.JobState, error) {
-	key := r.jobTargetStatePath(jobName)
-	resp, err := r.etcd.Get(key, false, false)
-	if err != nil {
-		if err.(*etcd.EtcdError).ErrorCode != etcdErr.EcodeNodeExist {
-			log.Errorf("Unable to determine target-state of Job(%s): %v", jobName, err)
-		}
-		return nil, err
-	}
-
-	return job.ParseJobState(resp.Node.Value), nil
-}
-
-func (r *EtcdRegistry) SetJobTargetState(jobName string, state job.JobState) error {
-	key := r.jobTargetStatePath(jobName)
-	_, err := r.etcd.Set(key, string(state), 0)
+func (r *EtcdRegistry) SetUnitTargetState(name string, state job.JobState) error {
+	key := r.jobTargetStatePath(name)
+	_, err := r.kAPI.Set(context.Background(), key, string(state), nil)
 	return err
 }
 
-func (es *EventStream) filterJobTargetStateChanges(resp *etcd.Response) *event.Event {
-	if resp.Action != "set" {
-		return nil
+func (r *EtcdRegistry) ScheduleUnit(name string, machID string) error {
+	key := r.jobTargetAgentPath(name)
+	opts := &etcd.SetOptions{
+		PrevExist: etcd.PrevNoExist,
 	}
-
-	dir, baseName := path.Split(resp.Node.Key)
-	if baseName != "target-state" {
-		return nil
-	}
-
-	dir = strings.TrimSuffix(dir, "/")
-	jobName := path.Base(dir)
-
-	ts := job.ParseJobState(resp.Node.Value)
-	if ts == nil {
-		return nil
-	}
-
-	cs := es.registry.determineJobState(jobName)
-	if *cs == *ts {
-		return nil
-	}
-
-	var cType string
-	switch *cs {
-	case job.JobStateInactive:
-		cType = "CommandLoadJob"
-	case job.JobStateLoaded:
-		if *ts == job.JobStateInactive {
-			cType = "CommandUnloadJob"
-		} else if *ts == job.JobStateLaunched {
-			cType = "CommandStartJob"
-		}
-	case job.JobStateLaunched:
-		if *ts == job.JobStateLoaded {
-			cType = "CommandStopJob"
-		} else if *ts == job.JobStateInactive {
-			cType = "CommandUnloadJob"
-		}
-	}
-
-	if cType == "" {
-		return nil
-	}
-
-	agent, _ := es.registry.GetJobTarget(jobName)
-	return &event.Event{cType, jobName, agent}
-}
-
-func (r *EtcdRegistry) ScheduleJob(jobName string, machID string) error {
-	key := r.jobTargetAgentPath(jobName)
-	_, err := r.etcd.Create(key, machID, 0)
+	_, err := r.kAPI.Set(context.Background(), key, machID, opts)
 	return err
-}
-
-func (r *EtcdRegistry) LockJob(jobName, context string) *TimedResourceMutex {
-	return r.lockResource("job", jobName, context)
-}
-
-func filterEventJobScheduled(resp *etcd.Response) *event.Event {
-	if resp.Action != "create" {
-		return nil
-	}
-
-	dir, baseName := path.Split(resp.Node.Key)
-	if baseName != "target" {
-		return nil
-	}
-
-	dir = strings.TrimSuffix(dir, "/")
-	dir, jobName := path.Split(dir)
-
-	dir = strings.TrimSuffix(dir, "/")
-	dir, prefixName := path.Split(dir)
-
-	if prefixName != jobPrefix {
-		return nil
-	}
-
-	return &event.Event{"EventJobScheduled", jobName, resp.Node.Value}
-}
-
-func filterEventJobUnscheduled(resp *etcd.Response) *event.Event {
-	if resp.Action != "delete" && resp.Action != "compareAndDelete" {
-		return nil
-	}
-
-	dir, baseName := path.Split(resp.Node.Key)
-	if baseName != "target" {
-		return nil
-	}
-
-	dir = strings.TrimSuffix(dir, "/")
-	dir, jobName := path.Split(dir)
-
-	dir = strings.TrimSuffix(dir, "/")
-	dir, prefixName := path.Split(dir)
-
-	if prefixName != jobPrefix {
-		return nil
-	}
-
-	if resp.PrevNode == nil {
-		return nil
-	}
-
-	return &event.Event{"EventJobUnscheduled", jobName, resp.PrevNode.Value}
-}
-
-func filterEventJobDestroyed(resp *etcd.Response) *event.Event {
-	if resp.Action != "delete" {
-		return nil
-	}
-
-	dir, jobName := path.Split(resp.Node.Key)
-	dir = strings.TrimSuffix(dir, "/")
-	dir, prefixName := path.Split(dir)
-
-	if prefixName != jobPrefix {
-		return nil
-	}
-
-	return &event.Event{"EventJobDestroyed", jobName, nil}
 }
 
 func (r *EtcdRegistry) jobTargetAgentPath(jobName string) string {
-	return path.Join(r.keyPrefix, jobPrefix, jobName, "target")
+	return r.prefixed(jobPrefix, jobName, "target")
 }
 
 func (r *EtcdRegistry) jobTargetStatePath(jobName string) string {
-	return path.Join(r.keyPrefix, jobPrefix, jobName, "target-state")
+	return r.prefixed(jobPrefix, jobName, "target-state")
 }

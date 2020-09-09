@@ -1,226 +1,177 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package agent
 
 import (
-	"encoding/json"
+	"fmt"
 	"path"
-	"sync"
-
-	log "github.com/coreos/fleet/third_party/github.com/golang/glog"
 
 	"github.com/coreos/fleet/job"
-	"github.com/coreos/fleet/resource"
+	"github.com/coreos/fleet/log"
+	"github.com/coreos/fleet/machine"
 )
 
 type AgentState struct {
-	// used to lock the datastructure for multi-goroutine safety
-	mutex sync.Mutex
-
-	// unresolved job offers
-	offers map[string]job.JobOffer
-
-	// job names for which a bid has been submitted
-	bids map[string]bool
-
-	// reverse index of peers that would cause a reassesment of a JobOffer this
-	// Agent could not have bid on previously
-	// i.e. {"hello.service": ["howareyou.service", "goodbye.service"]}
-	peers map[string][]string
-
-	// index of local payload conflicts to the job they belong to
-	Conflicts map[string][]string
-
-	// expected states of jobs scheduled to this agent
-	targetStates map[string]job.JobState
-
-	// resources by job
-	// TODO(uwedeportivo): this is temporary until we derive this from systemd
-	// systemd will give us useful info even for jobs that didn't declare resource reservations
-	resources map[string]resource.ResourceTuple
+	MState *machine.MachineState
+	Units  map[string]*job.Unit
 }
 
-func NewState() *AgentState {
+func NewAgentState(ms *machine.MachineState) *AgentState {
 	return &AgentState{
-		offers:       make(map[string]job.JobOffer),
-		bids:         make(map[string]bool),
-		peers:        make(map[string][]string),
-		Conflicts:    make(map[string][]string, 0),
-		targetStates: make(map[string]job.JobState),
-		resources:    make(map[string]resource.ResourceTuple),
+		MState: ms,
+		Units:  make(map[string]*job.Unit),
 	}
 }
 
-func (as *AgentState) Lock() {
-	log.V(1).Infof("Attempting to lock AgentState")
-	as.mutex.Lock()
-	log.V(1).Infof("AgentState locked")
+func (as *AgentState) unitScheduled(name string) bool {
+	return as.Units[name] != nil
 }
 
-func (as *AgentState) Unlock() {
-	log.V(1).Infof("Attempting to unlock AgentState")
-	as.mutex.Unlock()
-	log.V(1).Infof("AgentState unlocked")
-}
-
-func (as *AgentState) MarshalJSON() ([]byte, error) {
-	type ds struct {
-		Offers       map[string]job.JobOffer
-		Conflicts    map[string][]string
-		Bids         map[string]bool
-		Peers        map[string][]string
-		TargetStates map[string]job.JobState
-	}
-	data := ds{
-		Offers:       as.offers,
-		Conflicts:    as.Conflicts,
-		Bids:         as.bids,
-		Peers:        as.peers,
-		TargetStates: as.targetStates,
-	}
-	return json.Marshal(data)
-}
-
-// TrackJob extracts and stores information about the given job for later reference
-func (as *AgentState) TrackJob(j *job.Job) {
-	as.trackJobPeers(j.Name, j.Peers())
-	as.trackJobConflicts(j.Name, j.Conflicts())
-	as.trackJobResources(j.Name, j.Resources())
-}
-
-// PurgeJob removes all state tracked on behalf of a given job
-func (as *AgentState) PurgeJob(jobName string) {
-	as.dropTargetState(jobName)
-	as.dropPeersJob(jobName)
-	as.dropJobConflicts(jobName)
-	as.dropJobResources(jobName)
-}
-
-func (as *AgentState) trackJobConflicts(jobName string, conflicts []string) {
-	as.Conflicts[jobName] = conflicts
-}
-
-// Purge all tracked conflicts for a given Job
-func (as *AgentState) dropJobConflicts(jobName string) {
-	delete(as.Conflicts, jobName)
-}
-
-// Store a relation of 1 Job -> N Peers
-func (as *AgentState) trackJobPeers(jobName string, peers []string) {
-	for _, peer := range peers {
-		_, ok := as.peers[peer]
-		if !ok {
-			as.peers[peer] = make([]string, 0)
+func hasStringInSlice(inSlice []string, unitName string) bool {
+	for _, elem := range inSlice {
+		if globMatches(elem, unitName) {
+			return true
 		}
-		as.peers[peer] = append(as.peers[peer], jobName)
 	}
+	return false
 }
 
-func (as *AgentState) trackJobResources(jobName string, res resource.ResourceTuple) {
-	as.resources[jobName] = res
-}
+// HasConflict determines whether there are any known conflicts with the given Unit
+func (as *AgentState) HasConflict(pUnitName string, pConflicts []string) (bool, []string) {
+	found := false
+	conflicts := []string{}
 
-func (as *AgentState) dropJobResources(jobName string) {
-	delete(as.resources, jobName)
-}
+	for _, eUnit := range as.Units {
+		if pUnitName == eUnit.Name {
+			continue
+		}
 
-// Retrieve all Jobs that share a given Peer
-func (as *AgentState) GetJobsByPeer(peerName string) []string {
-	peers, ok := as.peers[peerName]
-	if ok {
-		return peers
+		if hasStringInSlice(eUnit.Conflicts(), pUnitName) {
+			conflicts = append(conflicts, pUnitName)
+			found = true
+			break
+		}
+		if hasStringInSlice(pConflicts, eUnit.Name) {
+			conflicts = append(conflicts, eUnit.Name)
+			found = true
+			break
+		}
 	}
-	return make([]string, 0)
+
+	if !found {
+		return false, []string{}
+	}
+
+	return true, conflicts
 }
 
-// Remove all references to a given Job from all Peer indexes
-func (as *AgentState) dropPeersJob(jobName string) {
-	for peer, peerIndex := range as.peers {
-		var idxs []int
+// hasReplace determines whether there are any known replaces with the given Unit
+func (as *AgentState) hasReplace(pUnitName string, pReplaces []string) (found bool, replace string) {
+	for _, eUnit := range as.Units {
+		foundPrepl := false
+		foundErepl := false
+		retStr := ""
 
-		// Determine which item indexes must be removed from the Peer index
-		for idx, record := range peerIndex {
-			if jobName == record {
-				idxs = append(idxs, idx)
+		if pUnitName == eUnit.Name {
+			continue
+		}
+
+		for _, pReplace := range pReplaces {
+			if globMatches(pReplace, eUnit.Name) {
+				foundPrepl = true
+				retStr = eUnit.Name
+				break
 			}
 		}
 
-		// Iterate through the item indexes, removing the corresponding Peers
-		for i, idx := range idxs {
-			as.peers[peer] = append(as.peers[peer][0:idx-i], as.peers[peer][idx-i+1:]...)
+		for _, eReplace := range eUnit.Replaces() {
+			if globMatches(eReplace, pUnitName) {
+				foundErepl = true
+				retStr = eUnit.Name
+				break
+			}
 		}
 
-		// Clean up empty peer relations when possible
-		if len(as.peers[peer]) == 0 {
-			delete(as.peers, peer)
-		}
-	}
-}
-
-func (as *AgentState) TrackOffer(offer job.JobOffer) {
-	as.offers[offer.Job.Name] = offer
-}
-
-// GetOffersWithoutBids returns all tracked JobOffers that have
-// no corresponding JobBid tracked in the same AgentState object.
-func (as *AgentState) GetOffersWithoutBids() []job.JobOffer {
-	offers := make([]job.JobOffer, 0)
-	for _, offer := range as.offers {
-		if !as.bids[offer.Job.Name] {
-			offers = append(offers, offer)
+		// Only 1 of 2 matches must be found. If both matches are found,
+		// it means it's a circular replace situation, which could result in
+		// an infinite loop. So ignore such replace options.
+		if (foundPrepl && foundErepl) || (!foundPrepl && !foundErepl) {
+			continue
+		} else {
+			found = true
+			replace = retStr
+			return
 		}
 	}
-	return offers
-}
 
-func (as *AgentState) PurgeOffer(name string) {
-	delete(as.offers, name)
-	delete(as.bids, name)
-}
-
-func (as *AgentState) TrackBid(name string) {
-	as.bids[name] = true
-}
-
-func (as *AgentState) HasBid(name string) bool {
-	return as.bids[name]
+	return
 }
 
 func globMatches(pattern, target string) bool {
 	matched, err := path.Match(pattern, target)
 	if err != nil {
-		log.V(1).Infof("Received error while matching pattern '%s': %v", pattern, err)
+		log.Debugf("Received error while matching pattern '%s': %v", pattern, err)
 	}
 	return matched
 }
 
-func (as *AgentState) SetTargetState(jobName string, state job.JobState) {
-	as.targetStates[jobName] = state
-}
+// AbleToRun determines if an Agent can run the provided Job based on
+// the Agent's current state. A boolean indicating whether this is the
+// case or not is returned. The following criteria is used:
+//   - Agent must meet the Job's machine target requirement (if any)
+//   - Agent must have all of the Job's required metadata (if any)
+//   - Agent must have all required Peers of the Job scheduled locally (if any)
+//   - Job must not conflict with any other Units scheduled to the agent
+//   - Job must specially handle replaced units to be rescheduled
+func (as *AgentState) AbleToRun(j *job.Job) (jobAction job.JobAction, errstr string) {
+	if tgt, ok := j.RequiredTarget(); ok && !as.MState.MatchID(tgt) {
+		return job.JobActionUnschedule, fmt.Sprintf("agent ID %q does not match required %q", as.MState.ID, tgt)
+	}
 
-func (as *AgentState) dropTargetState(jobName string) {
-	delete(as.targetStates, jobName)
-}
-
-func (as *AgentState) LaunchedJobs() []string {
-	jobs := make([]string, 0)
-	for j, ts := range as.targetStates {
-		if ts == job.JobStateLaunched {
-			jobs = append(jobs, j)
+	metadata := j.RequiredTargetMetadata()
+	if len(metadata) != 0 {
+		if !machine.HasMetadata(as.MState, metadata) {
+			return job.JobActionUnschedule, "local Machine metadata insufficient"
 		}
 	}
-	return jobs
-}
 
-func (as *AgentState) ScheduledJobs() []string {
-	jobs := make([]string, 0)
-	for j, ts := range as.targetStates {
-		if ts == job.JobStateLoaded || ts == job.JobStateLaunched {
-			jobs = append(jobs, j)
+	peers := j.Peers()
+	if len(peers) != 0 {
+		for _, peer := range peers {
+			if !as.unitScheduled(peer) {
+				return job.JobActionUnschedule, fmt.Sprintf("required peer Unit(%s) is not scheduled locally", peer)
+			}
 		}
 	}
-	return jobs
+
+	if cExists, cJobName := as.HasConflict(j.Name, j.Conflicts()); cExists {
+		return job.JobActionUnschedule, fmt.Sprintf("found conflict with locally-scheduled Unit(%s)", cJobName)
+	}
+
+	// Handle Replace option specially for rescheduling the unit
+	if cExists, cJobName := as.hasReplace(j.Name, j.Replaces()); cExists {
+		return job.JobActionReschedule, fmt.Sprintf("found replace with locally-scheduled Unit(%s)", cJobName)
+	}
+
+	return job.JobActionSchedule, ""
 }
 
-func (as *AgentState) ScheduledHere(jobName string) bool {
-	ts := as.targetStates[jobName]
-	return ts == job.JobStateLoaded || ts == job.JobStateLaunched
+func (as *AgentState) GetReplacedUnit(j *job.Job) (string, error) {
+	cExists, replaced := as.hasReplace(j.Name, j.Replaces())
+	if !cExists {
+		return "", fmt.Errorf("cannot find units to be replaced for Unit(%s)", j.Name)
+	}
+	return replaced, nil
 }

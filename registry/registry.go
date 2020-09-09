@@ -1,33 +1,23 @@
+// Copyright 2014 The fleet Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package registry
 
 import (
 	"encoding/json"
 	"fmt"
-
-	etcdErr "github.com/coreos/fleet/third_party/github.com/coreos/etcd/error"
-	"github.com/coreos/fleet/third_party/github.com/coreos/go-etcd/etcd"
 )
-
-const DefaultKeyPrefix = "/_coreos.com/fleet/"
-
-// EtcdRegistry fulfils the Registry interface and uses etcd as a backend
-type EtcdRegistry struct {
-	etcd      *etcd.Client
-	keyPrefix string
-}
-
-// New creates a new EtcdRegistry with the given parameters
-func New(client *etcd.Client, keyPrefix string) (registry Registry) {
-	return &EtcdRegistry{client, keyPrefix}
-}
-
-func (r *EtcdRegistry) GetDebugInfo() (string, error) {
-	resp, err := r.etcd.RawGet(r.keyPrefix, true, true)
-	if err != nil {
-		return "", err
-	}
-	return string(resp.Body), nil
-}
 
 func marshal(obj interface{}) (string, error) {
 	encoded, err := json.Marshal(obj)
@@ -43,9 +33,4 @@ func unmarshal(val string, obj interface{}) error {
 		return nil
 	}
 	return fmt.Errorf("unable to JSON-deserialize object: %s", err)
-}
-
-func isKeyNotFound(err error) bool {
-	e, ok := err.(*etcd.EtcdError)
-	return ok && e.ErrorCode == etcdErr.EcodeKeyNotFound
 }
